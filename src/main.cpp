@@ -562,8 +562,16 @@ void fillRect(SDL_Renderer* r, float x, float y, float w, float h, SDL_Color c) 
 struct View {
     Vec2 cam;
     float zoom = 1;
+    float angle = 0;  // screen rotation in radians (0 = north up)
+    float cosA = 1, sinA = 0;
+    void setAngle(float a) {
+        angle = a;
+        cosA = std::cos(a);
+        sinA = std::sin(a);
+    }
     Vec2 toScreen(Vec2 p) const {
-        return {(p.x - cam.x) * zoom + SCREEN_W * 0.5f, (p.y - cam.y) * zoom + SCREEN_H * 0.5f};
+        Vec2 d = p - cam;
+        return {(d.x * cosA - d.y * sinA) * zoom + SCREEN_W * 0.5f, (d.x * sinA + d.y * cosA) * zoom + SCREEN_H * 0.5f};
     }
 };
 
@@ -675,10 +683,14 @@ struct Minimap {
 
 struct Settings {
     int steerSensitivity = 100, steerSpeed = 100, padDeadzone = 12, cameraZoom = 100, lookAhead = 100;
+    int cameraMode = 0;
     int speedZoom = 1, mph = 0, ghost = 1, minimap = 1, skidMarks = 1, fullscreen = 0, vsync = 1;
 };
 
-enum class Kind { Percent, Toggle, Units, ResetBest, Resume, Quit };
+enum class Kind { Percent, Choice, Toggle, Units, ResetBest, Resume, Quit };
+
+enum CameraMode { CAM_FOLLOW, CAM_CHASE, CAM_LOCKED, CAM_HELICOPTER, CAM_COUNT };
+const char* CAMERA_NAMES[CAM_COUNT] = {"FOLLOW", "CHASE", "LOCKED", "HELICOPTER"};
 
 struct MenuEntry {
     const char* label;
@@ -692,6 +704,7 @@ const MenuEntry MENU[] = {
     {"STEERING SENSITIVITY", "steer_sensitivity", &Settings::steerSensitivity, 50, 150, 5, Kind::Percent},
     {"STEERING SPEED", "steer_speed", &Settings::steerSpeed, 50, 200, 10, Kind::Percent},
     {"GAMEPAD DEADZONE", "pad_deadzone", &Settings::padDeadzone, 0, 30, 2, Kind::Percent},
+    {"CAMERA MODE", "camera_mode", &Settings::cameraMode, 0, CAM_COUNT - 1, 1, Kind::Choice},
     {"CAMERA ZOOM", "camera_zoom", &Settings::cameraZoom, 60, 150, 5, Kind::Percent},
     {"CAMERA LOOK-AHEAD", "look_ahead", &Settings::lookAhead, 0, 150, 10, Kind::Percent},
     {"ZOOM OUT WITH SPEED", "speed_zoom", &Settings::speedZoom, 0, 1, 1, Kind::Toggle},
@@ -741,6 +754,7 @@ float menuRowY(int i) { return MENU_Y + 80 + i * MENU_ROW; }
 std::string menuValue(const MenuEntry& m, const Settings& s, const Menu& menu) {
     switch (m.kind) {
         case Kind::Percent: return "< " + std::to_string(s.*m.field) + "% >";
+        case Kind::Choice: return std::string("< ") + CAMERA_NAMES[s.*m.field] + " >";
         case Kind::Toggle: return s.*m.field ? "ON" : "OFF";
         case Kind::Units: return s.*m.field ? "MPH" : "KM/H";
         case Kind::ResetBest: return menu.confirmReset ? "CLICK OR ENTER AGAIN" : "";
@@ -756,9 +770,11 @@ int menuRowAt(float x, float y) {
     return i < MENU_COUNT ? i : -1;
 }
 
-// For a percentage row: -1 if x is on the "<" arrow, +1 on ">", 0 elsewhere.
+bool hasArrows(const MenuEntry& m) { return m.kind == Kind::Percent || m.kind == Kind::Choice; }
+
+// For a row with arrows: -1 if x is on the "<" arrow, +1 on ">", 0 elsewhere.
 int menuArrowAt(const MenuEntry& m, const Settings& s, const Menu& menu, float x) {
-    if (m.kind != Kind::Percent) return 0;
+    if (!hasArrows(m)) return 0;
     float left = MENU_VALUE_RIGHT - textWidth(menuValue(m, s, menu), 3);
     if (std::fabs(x - (left + 4)) < 22) return -1;
     if (x > MENU_VALUE_RIGHT - 30) return 1;
@@ -794,9 +810,9 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
 
     // Track (culled to what's roughly on screen).
     verts.clear();
-    float rx = SCREEN_W * 0.5f / view.zoom + 450, ry = SCREEN_H * 0.5f / view.zoom + 450;
+    float cull = std::hypot(SCREEN_W * 0.5f, SCREEN_H * 0.5f) / view.zoom + 450;
     for (const WorldQuad& q : quads) {
-        if (std::fabs(q.v[0].x - view.cam.x) > rx || std::fabs(q.v[0].y - view.cam.y) > ry) continue;
+        if (length(q.v[0] - view.cam) > cull) continue;
         pushQuad(verts, view.toScreen(q.v[0]), view.toScreen(q.v[1]), view.toScreen(q.v[2]),
                  view.toScreen(q.v[3]), q.c);
     }
@@ -922,7 +938,7 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
     }
 
     drawText(r, 14, SCREEN_H - 22, 2,
-             "WASD/ARROWS DRIVE  SPACE HANDBRAKE  R RESTART LAP  G GHOST  P PAUSE  ESC SETTINGS",
+             "WASD/ARROWS DRIVE  SPACE HANDBRAKE  R RESTART LAP  C CAMERA  G GHOST  P PAUSE  ESC SETTINGS",
              {220, 220, 220, 200});
     if (menu.open) drawMenu(r, menu, set);
 }
@@ -944,6 +960,43 @@ Input readInput(SDL_GameController* pad, const Settings& set) {
         in.handbrake = in.handbrake || SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A);
     }
     return in;
+}
+
+float lerpAngle(float a, float b, float t) { return a + std::remainder(b - a, 2.0f * float(M_PI)) * t; }
+
+// Moves the camera for the chosen mode. Smoothing is time-based so it feels
+// the same at any frame rate; snap jumps straight to the target.
+void updateCamera(View& view, const Game& g, const Settings& set, float frameDt, bool snap) {
+    float speed = length(g.car.vel);
+    float userZoom = set.cameraZoom / 100.0f, look = set.lookAhead / 100.0f;
+    float speedFactor = set.speedZoom ? 1.0f - 0.25f * std::min(speed / TOP_SPEED, 1.0f) : 1.0f;
+    float posRate = 8.0f, angleTarget = 0, zoomTarget = userZoom * speedFactor;
+    Vec2 target = g.car.pos + g.car.vel * (0.35f * look);
+
+    switch (set.cameraMode) {
+        case CAM_CHASE: {
+            // Rotates with the car so it always points up; car sits low on screen.
+            angleTarget = -g.car.heading - float(M_PI) / 2;
+            float a = -(snap ? angleTarget : view.angle) - float(M_PI) / 2;  // world direction of screen-up
+            target = g.car.pos + Vec2{std::cos(a), std::sin(a)} * (SCREEN_H * 0.22f * look / view.zoom);
+            posRate = 20.0f;
+            break;
+        }
+        case CAM_LOCKED:
+            target = g.car.pos;
+            zoomTarget = userZoom;
+            break;
+        case CAM_HELICOPTER:
+            zoomTarget = 0.42f * userZoom;
+            posRate = 3.0f;
+            break;
+        default: break;
+    }
+
+    auto blend = [&](float rate) { return snap ? 1.0f : 1.0f - std::exp(-rate * frameDt); };
+    view.zoom += (zoomTarget - view.zoom) * blend(3.0f);
+    view.setAngle(lerpAngle(view.angle, angleTarget, blend(6.0f)));
+    view.cam = set.cameraMode == CAM_LOCKED ? target : view.cam + (target - view.cam) * blend(posRate);
 }
 
 int runGame() {
@@ -1009,7 +1062,9 @@ int runGame() {
         const MenuEntry& m = MENU[menu.sel];
         if (!m.field) return;
         int& v = set.*m.field;
-        int nv = m.kind == Kind::Percent ? std::clamp(v + dir * m.step, m.lo, m.hi) : 1 - v;
+        int nv = m.kind == Kind::Percent  ? std::clamp(v + dir * m.step, m.lo, m.hi)
+                 : m.kind == Kind::Choice ? (v + dir - m.lo + (m.hi - m.lo + 1)) % (m.hi - m.lo + 1) + m.lo
+                                          : 1 - v;
         if (nv != v) {
             v = nv;
             changed();
@@ -1018,6 +1073,7 @@ int runGame() {
     auto menuActivate = [&]() {
         const MenuEntry& m = MENU[menu.sel];
         switch (m.kind) {
+            case Kind::Choice:
             case Kind::Toggle:
             case Kind::Units: menuAdjust(1); break;
             case Kind::ResetBest:
@@ -1034,9 +1090,15 @@ int runGame() {
             default: break;
         }
     };
+    bool snapCamera = true;
     auto restartLap = [&]() {
         game.resetToGrid();
-        view.cam = game.car.pos;
+        snapCamera = true;
+    };
+    auto cycleCamera = [&]() {
+        set.cameraMode = (set.cameraMode + 1) % CAM_COUNT;
+        changed();
+        game.flash(std::string("CAMERA: ") + CAMERA_NAMES[set.cameraMode], WHITE, 1.5f);
     };
     auto toggleMenu = [&]() {
         menu.open = !menu.open;
@@ -1064,6 +1126,7 @@ int runGame() {
                     case SDL_SCANCODE_ESCAPE: toggleMenu(); break;
                     case SDL_SCANCODE_R:
                     case SDL_SCANCODE_RETURN: restartLap(); break;
+                    case SDL_SCANCODE_C: cycleCamera(); break;
                     case SDL_SCANCODE_G: set.ghost = !set.ghost; changed(); break;
                     case SDL_SCANCODE_P: paused = !paused; break;
                     case SDL_SCANCODE_F11: set.fullscreen = !set.fullscreen; changed(); break;
@@ -1086,7 +1149,7 @@ int runGame() {
                     }
                 }
             }
-            if (menu.open && e.type == SDL_MOUSEWHEEL && MENU[menu.sel].kind == Kind::Percent) {
+            if (menu.open && e.type == SDL_MOUSEWHEEL && hasArrows(MENU[menu.sel])) {
                 int dy = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
                 if (dy != 0) menuAdjust(dy > 0 ? 1 : -1);
             }
@@ -1108,12 +1171,14 @@ int runGame() {
                     if (b == SDL_CONTROLLER_BUTTON_B) toggleMenu();
                 } else {
                     if (b == SDL_CONTROLLER_BUTTON_START || b == SDL_CONTROLLER_BUTTON_B) restartLap();
+                    if (b == SDL_CONTROLLER_BUTTON_Y) cycleCamera();
                 }
             }
         }
 
         Uint64 now = SDL_GetPerformanceCounter();
-        acc += std::min(0.25, double(now - prev) / SDL_GetPerformanceFrequency());
+        float frameDt = float(std::min(0.25, double(now - prev) / SDL_GetPerformanceFrequency()));
+        acc += frameDt;
         prev = now;
         if (paused || menu.open) acc = 0;
         Input in = readInput(pad, set);
@@ -1122,13 +1187,8 @@ int runGame() {
             acc -= DT;
         }
 
-        // Camera looks ahead and (optionally) zooms out with speed.
-        float speed = length(game.car.vel);
-        Vec2 target = game.car.pos + game.car.vel * (0.35f * set.lookAhead / 100.0f);
-        view.cam = view.cam + (target - view.cam) * 0.12f;
-        float speedFactor = set.speedZoom ? 1.0f - 0.25f * std::min(speed / TOP_SPEED, 1.0f) : 1.0f;
-        float zoomTarget = set.cameraZoom / 100.0f * speedFactor;
-        view.zoom += (zoomTarget - view.zoom) * 0.05f;
+        updateCamera(view, game, set, frameDt, snapCamera);
+        snapCamera = false;
 
         render(r, game, view, quads, mini, set, menu, paused, verts);
         SDL_RenderPresent(r);

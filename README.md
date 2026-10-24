@@ -39,6 +39,7 @@ Self-test (runs headless: an autopilot drives 3 laps to check lap timing, sector
 | Steer | A D / ← → | Left stick |
 | Handbrake (drift) | Space | A |
 | Restart lap (back behind the line, timer cleared) | R / Enter | B / Start |
+| Cycle camera mode | C | Y |
 | Settings menu | Esc | Back |
 | Toggle ghost | G | |
 | Pause | P | |
@@ -53,6 +54,7 @@ Press **Esc** to open the settings menu; the game pauses while it's open. With t
 | Steering sensitivity | 50–150% | How far the wheels turn at full lock. Lower is calmer, higher is twitchier |
 | Steering speed | 50–200% | How fast the wheel moves when you press or release a key |
 | Gamepad deadzone | 0–30% | How much stick movement is ignored around the centre |
+| Camera mode | Follow / Chase / Locked / Helicopter | See below (also cycles with C) |
 | Camera zoom | 60–150% | Lower shows more of the track |
 | Camera look-ahead | 0–150% | How far the camera leads the car in the direction you're going |
 | Zoom out with speed | on/off | Pulls the camera back at high speed |
@@ -62,6 +64,15 @@ Press **Esc** to open the settings menu; the game pauses while it's open. With t
 | Reset best lap | | Click or press Enter twice to wipe your record and ghost |
 
 The menu also has Resume and Quit.
+
+### Camera modes
+
+- **Follow:** the default. North stays up, and the camera leads the car in the direction it's moving.
+- **Chase:** the view rotates so your car always points up the screen, sitting low with the road ahead visible. This feels most like driving.
+- **Locked:** the car stays fixed in the centre of the screen. There's no look-ahead and no zoom with speed.
+- **Helicopter:** a high, wide view that shows the corners well in advance.
+
+Camera zoom applies in every mode. Look-ahead and zoom out with speed apply where they make sense.
 
 ## Rules
 
