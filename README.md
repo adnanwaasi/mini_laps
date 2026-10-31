@@ -1,6 +1,6 @@
 # F1 Hotlap
 
-A lightweight top-down time-trial racer in C++ with SDL2. Drive laps around the circuit, stay inside the track limits, and chase your best lap. Your best lap is saved, and a ghost car replays it while you drive.
+A lightweight top-down time-trial racer in C++ with SDL2. Pick a circuit, drive laps, stay inside the track limits, and chase your best lap. Your best lap on each circuit is saved, and a ghost car replays it while you drive.
 
 The whole game is one source file (`src/main.cpp`) with SDL2 as its only dependency. It has no image, font or sound assets: the engine note, tyre squeal, kerb rumble and impacts are all synthesised as you drive.
 
@@ -24,11 +24,21 @@ Or just use the script (it builds when needed, then launches):
 ./run.sh
 ```
 
-Self-test (runs headless: an autopilot drives 3 laps to check lap timing, sectors and the ghost):
+Self-test (runs headless: on every circuit it checks the layout, then an autopilot drives 3 laps to check lap timing, sectors, the live delta, the ghost and saving):
 
 ```sh
 ./build/f1_hotlap --selftest   # or: ctest --test-dir build
 ```
+
+## Circuits
+
+Choose the circuit at the top of the settings menu (Esc). Each one keeps its own best lap and ghost.
+
+| Circuit | Character |
+|---|---|
+| Parkland | The original: a mix of long sweepers, a hairpin and a fast back section |
+| Coastline | Fast. Long straights, two big stops and quick esses |
+| Harbour | Tight street circuit: right-angle corners and a chicane |
 
 ## Controls
 
@@ -51,6 +61,7 @@ Press **Esc** to open the settings menu; the game pauses while it's open. With t
 
 | Setting | Range | What it does |
 |---|---|---|
+| Track | Parkland / Coastline / Harbour | Switching starts a fresh session on that circuit |
 | Steering sensitivity | 50–150% | How far the wheels turn at full lock. Lower is calmer, higher is twitchier |
 | Steering speed | 50–200% | How fast the wheel moves when you press or release a key |
 | Gamepad deadzone | 0–30% | How much stick movement is ignored around the centre |
@@ -87,4 +98,4 @@ The dash at the bottom shows speed, gear and throttle/brake bars. The 15 rev lig
 - Each lap is split into 3 sectors (yellow lines). The sector deltas compare against your best lap: green is faster, red is slower. A sector time turns **purple** when it's the fastest you've ever driven that sector.
 - Once you have a best lap, the **DELTA** box at the top shows the live gap to it at your current spot on track (green means you're ahead).
 - **IDEAL** is your theoretical best: the sum of your best-ever sectors.
-- Your best valid lap, its ghost and your best sectors are saved to `best_lap.dat` next to the executable. Reset them from the settings menu, or delete the file.
+- Your best valid lap, its ghost and your best sectors are saved next to the executable, one file per circuit (`best_lap.dat` for Parkland, `best_lap_coastline.dat`, `best_lap_harbour.dat`). Reset the current circuit's record from the settings menu, or delete the file.

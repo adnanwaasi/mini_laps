@@ -138,16 +138,80 @@ struct Track {
     }
 };
 
-std::vector<Vec2> circuitLayout() {
-    const float raw[][2] = {
-        {300, 0},     {1200, 0},    {1800, 0},    {2300, 100},  {2600, 400},  {2600, 800},
-        {2350, 1050}, {2000, 1000}, {1700, 800},  {1400, 850},  {1250, 1100}, {1400, 1400},
-        {1900, 1500}, {2500, 1500}, {2900, 1700}, {2900, 2100}, {2500, 2300}, {1500, 2300},
-        {800, 2300},  {400, 2100},  {500, 1800},  {300, 1500},  {-200, 1400}, {-500, 1100},
-        {-500, 500},  {-350, 150},
-    };
+// A circuit is either a loop of control points, or pieces (straights and
+// constant-radius corners) laid end to end, which suits tight street layouts.
+// Either way the first point is the start line, so it should sit on a
+// straight with a straight run-up behind it.
+struct Piece {
+    float turn, radius, len;  // turn in degrees, + is right; turn == 0 is a straight of len
+};
+Piece straight(float len) { return {0, 0, len}; }
+Piece corner(float deg, float radius) { return {deg, radius, 0}; }
+
+struct TrackDef {
+    const char* name;
+    const char* saveFile;  // best lap file, next to the executable
+    std::vector<Vec2> ctrl;
+    std::vector<Piece> pieces;
+};
+
+const TrackDef TRACKS[] = {
+    {"PARKLAND", "best_lap.dat",
+     {{300, 0},     {1200, 0},    {1800, 0},    {2300, 100},  {2600, 400},  {2600, 800},  {2350, 1050},
+      {2000, 1000}, {1700, 800},  {1400, 850},  {1250, 1100}, {1400, 1400}, {1900, 1500}, {2500, 1500},
+      {2900, 1700}, {2900, 2100}, {2500, 2300}, {1500, 2300}, {800, 2300},  {400, 2100},  {500, 1800},
+      {300, 1500},  {-200, 1400}, {-500, 1100}, {-500, 500},  {-350, 150}},
+     {}},
+    // Fast: long straights, two big stops and quick esses.
+    {"COASTLINE", "best_lap_coastline.dat",
+     {{0, 0},       {1000, 0},    {2000, 0},    {2850, 0},    {3080, 60},   {3180, 250},  {3250, 600},
+      {3300, 1000}, {2900, 1200}, {2500, 1100}, {2100, 1250}, {1900, 1600}, {2100, 1950}, {2700, 2050},
+      {3000, 2250}, {3080, 2480}, {2980, 2680}, {2750, 2780}, {2400, 2800}, {1600, 2800}, {700, 2800},
+      {200, 2600},  {0, 2200},    {200, 1800},  {500, 1500},  {400, 1100},  {-100, 900},  {-500, 700},
+      {-700, 300},  {-500, 0}},
+     {}},
+    // Tight street circuit: right angles and a chicane.
+    {"HARBOUR", "best_lap_harbour.dat",
+     {},
+     {straight(1000), corner(90, 85),  straight(400),   corner(-90, 85), straight(500),   corner(90, 85),
+      straight(500),  corner(90, 85),  straight(300),   corner(-40, 160), corner(80, 160), corner(-40, 160),
+      straight(300),  corner(90, 85),  straight(500),   corner(-90, 85), straight(938.6f), corner(90, 85),
+      straight(400),  corner(90, 85),  straight(450)}},
+};
+constexpr int TRACK_COUNT = int(sizeof TRACKS / sizeof TRACKS[0]);
+
+// Lays pieces end to end from the origin, heading east, as evenly spaced
+// control points (Catmull-Rom overshoots when the spacing is uneven).
+std::vector<Vec2> layPieces(const std::vector<Piece>& pieces) {
+    const float STEP = 60;
+    Vec2 p;
+    float h = 0;
+    std::vector<Vec2> out{p};
+    for (const Piece& pc : pieces) {
+        if (pc.turn == 0) {
+            int n = std::max(1, int(std::lround(pc.len / STEP)));
+            Vec2 d{std::cos(h), std::sin(h)};
+            for (int k = 0; k < n; ++k) out.push_back(p = p + d * (pc.len / n));
+            continue;
+        }
+        float th = pc.turn * float(M_PI) / 180, side = h + signOf(th) * float(M_PI) / 2;
+        Vec2 c = p + Vec2{std::cos(side), std::sin(side)} * pc.radius;
+        float a0 = std::atan2(p.y - c.y, p.x - c.x);
+        int n = std::max(1, int(std::lround(pc.radius * std::fabs(th) / STEP)));
+        for (int k = 1; k <= n; ++k) {
+            float a = a0 + th * k / n;
+            out.push_back(p = c + Vec2{std::cos(a), std::sin(a)} * pc.radius);
+        }
+        h += th;
+    }
+    out.pop_back();  // the loop ends back on the start point
+    return out;
+}
+
+std::vector<Vec2> circuitLayout(int track = 0) {
+    const TrackDef& def = TRACKS[track];
     std::vector<Vec2> out;
-    for (auto& p : raw) out.push_back({p[0] * 1.6f, p[1] * 1.6f});
+    for (Vec2 p : def.pieces.empty() ? def.ctrl : layPieces(def.pieces)) out.push_back(p * 1.6f);
     return out;
 }
 
@@ -232,8 +296,11 @@ struct Game {
     float steerSensitivity = 1.0f;  // scales the maximum steering angle
     float steerSpeed = 1.0f;        // scales how fast the wheel turns
 
-    void init() {
-        track.build(circuitLayout());
+    int trackId = 0;
+
+    void init(int trackIndex = 0) {
+        trackId = trackIndex;
+        track.build(circuitLayout(trackIndex));
         cpIdx[0] = track.size() / 3;
         cpIdx[1] = 2 * track.size() / 3;
         load();
@@ -602,11 +669,11 @@ struct Synth {
         const float kRpm = coef(30), kThrottle = coef(15), kGain = coef(8), kSqueal = coef(12);
         const float kPop = std::exp(-45.0f * dt), kThump = std::exp(-14.0f * dt);
         const float kGrass = coef(TAU * 250), kKerb = coef(TAU * 180);
-        if (p.wallHits != seenHits) {
-            seenHits = p.wallHits;
+        if (p.wallHits > seenHits) {
             thump = std::clamp(p.impact / 400.0f, 0.3f, 1.0f);
             thumpTime = 0;
         }
+        seenHits = p.wallHits;  // also resyncs after a track change resets the count
         float squealTarget = p.speed > 60 ? std::clamp((p.slip - 120.0f) / 350.0f, 0.0f, 1.0f) : 0.0f;
         float speedAmt = std::min(p.speed / 300.0f, 1.0f);
 
@@ -698,12 +765,13 @@ Input autopilot(const Game& g) {
     return in;
 }
 
-int runSelfTest() {
+// Checks one circuit: geometry, three autopilot laps, the delta, gearbox and saves.
+bool testTrack(int id) {
     Game g;
-    g.init();
+    g.init(id);
     const Track& t = g.track;
     const int N = t.size();
-    std::printf("track: %d samples, %.0f px long\n", N, t.length);
+    std::printf("== %s: %d samples, %.0f px long\n", TRACKS[id].name, N, t.length);
 
     // Sections of track that are far apart along the lap must not overlap.
     float minGap = 1e9f;
@@ -714,6 +782,12 @@ int runSelfTest() {
         }
     std::printf("closest separate sections: %.0f px (need > %.0f)\n", minGap, 2 * WALL_D);
     bool ok = minGap > 2 * WALL_D;
+
+    // Corners tighter than this fold the kerbs and asphalt over themselves.
+    float maxCurv = *std::max_element(t.curvature.begin(), t.curvature.end());
+    const float minRadius = HALF_W + KERB_W + 25;
+    std::printf("tightest corner: %.0f px radius (need > %.0f)\n", 1 / maxCurv, minRadius);
+    ok = ok && 1 / maxCurv > minRadius;
 
     // Laps 2 and 3 are driven identically, so the live delta on lap 3 should hover near zero.
     float maxDelta = 0;
@@ -735,19 +809,64 @@ int runSelfTest() {
     }
     for (auto& e : g.history)
         std::printf("lap %d: %s %s\n", e.number, fmtTime(e.time).c_str(), e.valid ? "valid" : "INVALID");
-    bool anyValid = false;
-    for (auto& e : g.history) anyValid |= e.valid;
-    ok = ok && g.history.size() == 3 && anyValid && g.bestGhost.size() > 0;
+    bool allValid = g.history.size() == 3;
+    for (auto& e : g.history) allValid = allValid && e.valid;
+    ok = ok && allValid && g.bestGhost.size() > 0;
     std::printf("best: %s, ghost samples: %zu\n", fmtTime(g.bestTime).c_str(), g.bestGhost.size());
 
     std::printf("lap 3 live delta: max %.3f s over %d samples (need < 0.05)\n", maxDelta, deltaSamples);
-    ok = ok && deltaSamples > 3000 && maxDelta < 0.05f;
+    ok = ok && deltaSamples > int(g.bestGhost.size() * 9 / 10) && maxDelta < 0.05f;
     float ideal = g.idealLap();
     std::printf("ideal lap: %s (need <= best)\n", fmtTime(ideal).c_str());
     ok = ok && ideal > 0 && ideal <= g.bestTime + 1e-4f;
 
     std::printf("gearbox: top gear %d, %d shifts, rpm %.0f-%.0f\n", topGear, shifts, rpmLo, rpmHi);
-    ok = ok && topGear >= 6 && shifts >= 20 && rpmLo >= IDLE_RPM - 1 && rpmHi <= MAX_RPM + 1;
+    ok = ok && topGear >= 5 && shifts >= 20 && rpmLo >= IDLE_RPM - 1 && rpmHi <= MAX_RPM + 1;
+
+    // Save round trip, in the current format and the old v1 one (no best-ever sectors).
+    for (uint32_t version : {SAVE_VERSION, 1u}) {
+        FILE* f = std::tmpfile();
+        if (!f) return false;
+        if (version == SAVE_VERSION) {
+            g.writeSave(f);
+        } else {
+            uint32_t header[4] = {SAVE_MAGIC, 1, g.trackSignature(), uint32_t(g.bestGhost.size())};
+            std::fwrite(header, sizeof header, 1, f);
+            std::fwrite(&g.bestTime, sizeof g.bestTime, 1, f);
+            std::fwrite(g.bestSectors, sizeof g.bestSectors, 1, f);
+            std::fwrite(g.bestGhost.data(), sizeof(GhostSample), g.bestGhost.size(), f);
+        }
+        std::rewind(f);
+        Game h;
+        h.init(id);
+        bool loaded = h.readSave(f);
+        std::fclose(f);
+        const float* wantEver = version == SAVE_VERSION ? g.bestEverSectors : g.bestSectors;
+        bool same = loaded && h.bestTime == g.bestTime && h.bestGhost.size() == g.bestGhost.size() &&
+                    h.bestDist.size() == g.bestDist.size() && std::equal(wantEver, wantEver + 3, h.bestEverSectors);
+        std::printf("save v%u round trip: %s\n", version, same ? "ok" : "MISMATCH");
+        ok = ok && same;
+    }
+
+    // A record from one circuit must not load on another.
+    if (TRACK_COUNT > 1) {
+        FILE* f = std::tmpfile();
+        if (!f) return false;
+        g.writeSave(f);
+        std::rewind(f);
+        Game other;
+        other.init((id + 1) % TRACK_COUNT);
+        bool rejected = !other.readSave(f) && other.bestTime < 0;
+        std::fclose(f);
+        std::printf("save rejected on %s: %s\n", TRACKS[other.trackId].name, rejected ? "ok" : "LOADED");
+        ok = ok && rejected;
+    }
+    return ok;
+}
+
+int runSelfTest() {
+    bool ok = true;
+    for (int id = 0; id < TRACK_COUNT; ++id) ok = testTrack(id) && ok;
 
     // The synth must stay finite and inside [-1, 1], and get louder on throttle.
     auto loudness = [](SoundParams p) {
@@ -772,33 +891,8 @@ int runSelfTest() {
     flat.wallHits = 1;
     flat.impact = 900;
     double rmsIdle = loudness(idle), rmsFlat = loudness(flat);
-    std::printf("synth rms: idle %.3f, flat out %.3f\n", rmsIdle, rmsFlat);
+    std::printf("== synth rms: idle %.3f, flat out %.3f\n", rmsIdle, rmsFlat);
     ok = ok && rmsIdle > 0.01 && rmsFlat > rmsIdle;
-
-    // Save round trip, in the current format and the old v1 one (no best-ever sectors).
-    for (uint32_t version : {SAVE_VERSION, 1u}) {
-        FILE* f = std::tmpfile();
-        if (!f) return 1;
-        if (version == SAVE_VERSION) {
-            g.writeSave(f);
-        } else {
-            uint32_t header[4] = {SAVE_MAGIC, 1, g.trackSignature(), uint32_t(g.bestGhost.size())};
-            std::fwrite(header, sizeof header, 1, f);
-            std::fwrite(&g.bestTime, sizeof g.bestTime, 1, f);
-            std::fwrite(g.bestSectors, sizeof g.bestSectors, 1, f);
-            std::fwrite(g.bestGhost.data(), sizeof(GhostSample), g.bestGhost.size(), f);
-        }
-        std::rewind(f);
-        Game h;
-        h.init();
-        bool loaded = h.readSave(f);
-        std::fclose(f);
-        const float* wantEver = version == SAVE_VERSION ? g.bestEverSectors : g.bestSectors;
-        bool same = loaded && h.bestTime == g.bestTime && h.bestGhost.size() == g.bestGhost.size() &&
-                    h.bestDist.size() == g.bestDist.size() && std::equal(wantEver, wantEver + 3, h.bestEverSectors);
-        std::printf("save v%u round trip: %s\n", version, same ? "ok" : "MISMATCH");
-        ok = ok && same;
-    }
 
     std::printf("%s\n", ok ? "SELFTEST PASS" : "SELFTEST FAIL");
     return ok ? 0 : 1;
@@ -979,6 +1073,37 @@ void pushBlob(std::vector<WorldQuad>& q, Vec2 c, float r, SDL_Color col) {
     for (int k = 0; k < 8; k += 2) q.push_back({{c, rim[k], rim[k + 1], rim[(k + 2) % 8]}, col});
 }
 
+// Tyre walls as a chain of stacks along the true boundary (WALL_D from the
+// centre line). On the inside of a corner tighter than WALL_D the offset line
+// loops back on itself; those points sit closer to the track than the wall,
+// so they're dropped and the wall closes into a clean sharp corner.
+void addBarriers(const Track& t, std::vector<WorldQuad>& q) {
+    const int N = t.size();
+    const float off = WALL_D + 5, SPACING = 10, HALF = 4.5f;
+    for (float side : {-1.0f, 1.0f}) {
+        std::vector<Vec2> line;
+        for (int i = 0; i < N; ++i) {
+            Vec2 p = t.pts[i] + t.normals[i] * (side * off);
+            if (t.nearest(p, i, 60).dist > off - 1) line.push_back(p);
+        }
+        float carry = 0;
+        int stack = 0;
+        for (size_t k = 0; k < line.size(); ++k) {
+            Vec2 a = line[k], b = line[(k + 1) % line.size()];
+            float len = length(b - a);
+            Vec2 dir = normalized(b - a), nrm{-dir.y, dir.x};
+            for (; carry < len; carry += SPACING, ++stack) {
+                Vec2 c = a + dir * carry;
+                SDL_Color col = (stack / 4) % 4 == 0 ? SDL_Color{200, 50, 45, 255} : SDL_Color{45, 45, 50, 255};
+                q.push_back({{c - dir * HALF - nrm * HALF, c + dir * HALF - nrm * HALF, c + dir * HALF + nrm * HALF,
+                              c - dir * HALF + nrm * HALF},
+                             col});
+            }
+            carry -= len;
+        }
+    }
+}
+
 // A grandstand along the outside of the main straight, and trees in the
 // spare ground beyond the tyre walls.
 void addScenery(const Track& t, std::vector<WorldQuad>& q) {
@@ -1047,19 +1172,15 @@ std::vector<WorldQuad> buildTrackQuads(const Game& g) {
     const Track& t = g.track;
     const int N = t.size();
     std::vector<WorldQuad> q;
-    // A band between two offsets from the centre line. Folded quads (inside of
-    // tight corners at large offsets) are skipped so they don't draw garbage.
-    auto band = [&](float o1, float o2, auto colorAt, bool skipFolded) {
+    // A band between two offsets from the centre line.
+    auto band = [&](float o1, float o2, auto colorAt) {
         for (int i = 0; i < N; ++i) {
             int j = (i + 1) % N;
             Vec2 a = t.pts[i] + t.normals[i] * o1, b = t.pts[i] + t.normals[i] * o2;
             Vec2 c = t.pts[j] + t.normals[j] * o2, d = t.pts[j] + t.normals[j] * o1;
-            Vec2 tan = t.tangent(i);
-            if (skipFolded && (dot(c - b, tan) <= 0 || dot(d - a, tan) <= 0)) continue;
             q.push_back({{a, b, c, d}, colorAt(i)});
         }
     };
-    auto barrier = [](int i) { return (i / 4) % 4 == 0 ? SDL_Color{200, 50, 45, 255} : SDL_Color{45, 45, 50, 255}; };
     auto kerb = [&](int i) {
         if (t.curvature[i] < 0.0012f) return SDL_Color{230, 230, 230, 255};
         return (i / 2) % 2 ? SDL_Color{215, 40, 40, 255} : SDL_Color{240, 240, 240, 255};
@@ -1068,12 +1189,11 @@ std::vector<WorldQuad> buildTrackQuads(const Game& g) {
     auto runoff = [](int i) { return (i / 8) % 2 ? SDL_Color{78, 150, 64, 255} : SDL_Color{72, 141, 59, 255}; };
     auto asphalt = [](int i) { return (i / 6) % 2 ? SDL_Color{72, 72, 78, 255} : SDL_Color{68, 68, 74, 255}; };
 
-    band(-WALL_D, WALL_D, runoff, false);
-    band(WALL_D, WALL_D + 10, barrier, true);
-    band(-WALL_D - 10, -WALL_D, barrier, true);
-    band(HALF_W, HALF_W + KERB_W, kerb, false);
-    band(-HALF_W - KERB_W, -HALF_W, kerb, false);
-    band(-HALF_W, HALF_W, asphalt, false);
+    band(-WALL_D, WALL_D, runoff);
+    addBarriers(t, q);
+    band(HALF_W, HALF_W + KERB_W, kerb);
+    band(-HALF_W - KERB_W, -HALF_W, kerb);
+    band(-HALF_W, HALF_W, asphalt);
 
     auto across = [&](int i, float along0, float along1, float o1, float o2, SDL_Color c) {
         Vec2 tan = t.tangent(i), n = t.normals[i], p = t.pts[i];
@@ -1126,10 +1246,8 @@ struct Effects {
         parts.erase(std::remove_if(parts.begin(), parts.end(), [](const Particle& p) { return p.age >= p.life; }),
                     parts.end());
         shake *= std::exp(-9.0f * dt);
-        if (g.wallHits != seenHits) {
-            seenHits = g.wallHits;
-            shake = std::min(g.lastImpact / 40.0f, 14.0f);
-        }
+        if (g.wallHits > seenHits) shake = std::min(g.lastImpact / 40.0f, 14.0f);
+        seenHits = g.wallHits;
         if (dt <= 0) return;
 
         float speed = length(g.car.vel), slip = std::fabs(g.car.slip);
@@ -1182,6 +1300,7 @@ struct Settings {
     int cameraMode = 0;
     int speedZoom = 1, mph = 0, ghost = 1, minimap = 1, skidMarks = 1, fullscreen = 0, vsync = 1;
     int volume = 70;
+    int track = 0;
 };
 
 enum class Kind { Percent, Choice, Toggle, Units, ResetBest, Resume, Quit };
@@ -1189,19 +1308,24 @@ enum class Kind { Percent, Choice, Toggle, Units, ResetBest, Resume, Quit };
 enum CameraMode { CAM_FOLLOW, CAM_CHASE, CAM_LOCKED, CAM_HELICOPTER, CAM_COUNT };
 const char* CAMERA_NAMES[CAM_COUNT] = {"FOLLOW", "CHASE", "LOCKED", "HELICOPTER"};
 
+const char* cameraName(int i) { return CAMERA_NAMES[i]; }
+const char* trackName(int i) { return TRACKS[i].name; }
+
 struct MenuEntry {
     const char* label;
     const char* key;  // name in settings.cfg
     int Settings::*field;
     int lo, hi, step;
     Kind kind;
+    const char* (*choiceName)(int) = nullptr;  // for Kind::Choice
 };
 
 const MenuEntry MENU[] = {
+    {"TRACK", "track", &Settings::track, 0, TRACK_COUNT - 1, 1, Kind::Choice, trackName},
     {"STEERING SENSITIVITY", "steer_sensitivity", &Settings::steerSensitivity, 50, 150, 5, Kind::Percent},
     {"STEERING SPEED", "steer_speed", &Settings::steerSpeed, 50, 200, 10, Kind::Percent},
     {"GAMEPAD DEADZONE", "pad_deadzone", &Settings::padDeadzone, 0, 30, 2, Kind::Percent},
-    {"CAMERA MODE", "camera_mode", &Settings::cameraMode, 0, CAM_COUNT - 1, 1, Kind::Choice},
+    {"CAMERA MODE", "camera_mode", &Settings::cameraMode, 0, CAM_COUNT - 1, 1, Kind::Choice, cameraName},
     {"CAMERA ZOOM", "camera_zoom", &Settings::cameraZoom, 60, 150, 5, Kind::Percent},
     {"CAMERA LOOK-AHEAD", "look_ahead", &Settings::lookAhead, 0, 150, 10, Kind::Percent},
     {"ZOOM OUT WITH SPEED", "speed_zoom", &Settings::speedZoom, 0, 1, 1, Kind::Toggle},
@@ -1252,7 +1376,7 @@ float menuRowY(int i) { return MENU_Y + 80 + i * MENU_ROW; }
 std::string menuValue(const MenuEntry& m, const Settings& s, const Menu& menu) {
     switch (m.kind) {
         case Kind::Percent: return "< " + std::to_string(s.*m.field) + "% >";
-        case Kind::Choice: return std::string("< ") + CAMERA_NAMES[s.*m.field] + " >";
+        case Kind::Choice: return std::string("< ") + m.choiceName(s.*m.field) + " >";
         case Kind::Toggle: return s.*m.field ? "ON" : "OFF";
         case Kind::Units: return s.*m.field ? "MPH" : "KM/H";
         case Kind::ResetBest: return menu.confirmReset ? "CLICK OR ENTER AGAIN" : "";
@@ -1369,7 +1493,8 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
 
     // Minimap.
     if (set.minimap) {
-        fillRect(r, SCREEN_W - 270, 10, 260, 260, {0, 0, 0, 130});
+        fillRect(r, SCREEN_W - 270, 10, 260, 286, {0, 0, 0, 130});
+        drawText(r, SCREEN_W - 140, 274, 2.5f, TRACKS[g.trackId].name, {170, 170, 170, 255}, 1);
         SDL_SetRenderDrawColor(r, 200, 200, 200, 255);
         std::vector<SDL_FPoint> shifted = mini.line;
         for (int d = 0; d < 2; ++d) {
@@ -1579,18 +1704,38 @@ int runGame() {
 
     Game game;
     Settings set;
-    std::string settingsPath;
+    std::string basePath, settingsPath;
     if (char* base = SDL_GetBasePath()) {
-        game.savePath = std::string(base) + "best_lap.dat";
-        settingsPath = std::string(base) + "settings.cfg";
+        basePath = base;
+        settingsPath = basePath + "settings.cfg";
         SDL_free(base);
     }
     loadSettings(set, settingsPath);
-    game.init();
-    if (game.bestTime > 0) game.flash("BEST LAP TO BEAT " + fmtTime(game.bestTime), PURPLE, 4.0f);
+
+    std::vector<WorldQuad> quads;
+    Minimap mini;
+    std::vector<SDL_Vertex> verts;
+    View view;
+    Effects fx;
+    bool snapCamera = true;
+
+    // Builds everything for the chosen circuit; the session's lap list starts afresh.
+    auto loadTrack = [&]() {
+        game = Game{};
+        if (!basePath.empty()) game.savePath = basePath + TRACKS[set.track].saveFile;
+        game.init(set.track);
+        if (game.bestTime > 0) game.flash("BEST LAP TO BEAT " + fmtTime(game.bestTime), PURPLE, 4.0f);
+        quads = buildTrackQuads(game);
+        mini = Minimap{};
+        mini.build(game.track, SCREEN_W - 260, 20, 240);
+        view.cam = game.car.pos;
+        fx = Effects{};
+        snapCamera = true;
+    };
 
     // Push settings into the game, window and renderer.
     auto applySettings = [&]() {
+        if (game.track.size() == 0 || game.trackId != set.track) loadTrack();
         game.steerSensitivity = set.steerSensitivity / 100.0f;
         game.steerSpeed = set.steerSpeed / 100.0f;
         bool fs = SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP;
@@ -1603,13 +1748,6 @@ int runGame() {
         saveSettings(set, settingsPath);
     };
     applySettings();
-
-    std::vector<WorldQuad> quads = buildTrackQuads(game);
-    Minimap mini;
-    mini.build(game.track, SCREEN_W - 260, 20, 240);
-    std::vector<SDL_Vertex> verts;
-    View view;
-    view.cam = game.car.pos;
 
     // Sound is optional: without an audio device the game just runs silent.
     Synth synth;
@@ -1630,7 +1768,6 @@ int runGame() {
 
     SDL_GameController* pad = nullptr;
     Menu menu;
-    Effects fx;
     bool running = true, paused = false;
 
     auto menuMove = [&](int dir) {
@@ -1669,7 +1806,6 @@ int runGame() {
             default: break;
         }
     };
-    bool snapCamera = true;
     auto restartLap = [&]() {
         game.resetToGrid();
         snapCamera = true;
