@@ -938,212 +938,6 @@ Input autopilot(const Game& g, bool useDrs = true) {
     return in;
 }
 
-// Checks one circuit: geometry, three autopilot laps, the delta, gearbox and saves.
-bool testTrack(int id) {
-    Game g;
-    g.init(id);
-    const Track& t = g.track;
-    const int N = t.size();
-    std::printf("== %s: %d samples, %.0f px long\n", TRACKS[id].name, N, t.length);
-
-    // Sections of track that are far apart along the lap must not overlap.
-    float minGap = 1e9f;
-    for (int i = 0; i < N; ++i)
-        for (int j = i + 1; j < N; ++j) {
-            float along = std::min(t.arc[j] - t.arc[i], t.length - (t.arc[j] - t.arc[i]));
-            if (along > 1200.0f) minGap = std::min(minGap, length(t.pts[i] - t.pts[j]));
-        }
-    std::printf("closest separate sections: %.0f px (need > %.0f)\n", minGap, 2 * WALL_D);
-    bool ok = minGap > 2 * WALL_D;
-
-    // Corners tighter than this fold the kerbs and asphalt over themselves.
-    float maxCurv = *std::max_element(t.curvature.begin(), t.curvature.end());
-    const float minRadius = HALF_W + KERB_W + 25;
-    std::printf("tightest corner: %.0f px radius (need > %.0f)\n", 1 / maxCurv, minRadius);
-    ok = ok && 1 / maxCurv > minRadius;
-
-    // The racing line should open the corners up well beyond the centre line,
-    // and stay on the asphalt. Curvature is averaged over 9 samples, as for the centre line.
-    std::vector<float> raw(N);
-    float lineCurv = 0, lineOff = 0;
-    for (int i = 0; i < N; ++i) {
-        Vec2 u = t.line[i] - t.line[(i - 1 + N) % N], v = t.line[(i + 1) % N] - t.line[i];
-        raw[i] = std::fabs(std::atan2(cross(u, v), dot(u, v))) / (0.5f * (length(u) + length(v)));
-        lineOff = std::max(lineOff, std::fabs(dot(t.line[i] - t.pts[i], t.normals[i])));
-    }
-    for (int i = 0; i < N; ++i) {
-        float k = 0;
-        for (int j = -4; j <= 4; ++j) k += raw[((i + j) % N + N) % N];
-        lineCurv = std::max(lineCurv, k / 9);
-    }
-    std::printf("racing line: tightest %.0f px radius (need > 1.3x centre), widest %.0f px off centre (need < %.0f)\n",
-                1 / lineCurv, lineOff, HALF_W);
-    ok = ok && 1 / lineCurv > 1.3f / maxCurv && lineOff < HALF_W;
-
-    // Laps 2 and 3 are driven identically, so the live delta on lap 3 should hover near zero.
-    float maxDelta = 0;
-    int deltaSamples = 0;
-    int topGear = 0, shifts = 0;
-    float rpmLo = 1e9f, rpmHi = 0;
-    for (long s = 0; s < 120L * 600 && g.history.size() < 3; ++s) {
-        int gearBefore = g.gear;
-        g.step(autopilot(g));
-        topGear = std::max(topGear, g.gear);
-        shifts += g.gear != gearBefore;
-        rpmLo = std::min(rpmLo, g.rpm);
-        rpmHi = std::max(rpmHi, g.rpm);
-        float d;
-        if (g.history.size() == 2 && g.liveDelta(d)) {
-            maxDelta = std::max(maxDelta, std::fabs(d));
-            ++deltaSamples;
-        }
-    }
-    for (auto& e : g.history)
-        std::printf("lap %d: %s %s\n", e.number, fmtTime(e.time).c_str(), e.valid ? "valid" : "INVALID");
-    bool allValid = g.history.size() == 3;
-    for (auto& e : g.history) allValid = allValid && e.valid;
-    ok = ok && allValid && g.bestGhost.size() > 0;
-    std::printf("best: %s, ghost samples: %zu\n", fmtTime(g.bestTime).c_str(), g.bestGhost.size());
-
-    std::printf("lap 3 live delta: max %.3f s over %d samples (need < 0.05)\n", maxDelta, deltaSamples);
-    ok = ok && deltaSamples > int(g.bestGhost.size() * 9 / 10) && maxDelta < 0.05f;
-    float ideal = g.idealLap();
-    std::printf("ideal lap: %s (need <= best)\n", fmtTime(ideal).c_str());
-    ok = ok && ideal > 0 && ideal <= g.bestTime + 1e-4f;
-
-    std::printf("gearbox: top gear %d, %d shifts, rpm %.0f-%.0f\n", topGear, shifts, rpmLo, rpmHi);
-    ok = ok && topGear >= 5 && shifts >= topGear && rpmLo >= IDLE_RPM - 1 && rpmHi <= MAX_RPM + 1;
-
-    // Every circuit has DRS on at least one straight, and using it saves time.
-    int zones = 0;
-    float zoneLen = 0;
-    for (int i = 0; i < N; ++i) {
-        zones += t.drsZone[i] && !t.drsZone[(i - 1 + N) % N];
-        if (t.drsZone[i]) zoneLen += length(t.pts[(i + 1) % N] - t.pts[i]);
-    }
-    Game noDrs;
-    noDrs.init(id);
-    for (long s = 0; s < 120L * 600 && noDrs.history.size() < 2; ++s) noDrs.step(autopilot(noDrs, false));
-    std::printf("drs: %d zone(s), %.0f px; best lap %s with it, %s without\n", zones, zoneLen,
-                fmtTime(g.bestTime).c_str(), fmtTime(noDrs.bestTime).c_str());
-    ok = ok && zones >= 1 && noDrs.bestTime > g.bestTime;
-
-    // Save round trip, in the current format and the old v1 one (no best-ever sectors).
-    for (uint32_t version : {SAVE_VERSION, 1u}) {
-        FILE* f = std::tmpfile();
-        if (!f) return false;
-        if (version == SAVE_VERSION) {
-            g.writeSave(f);
-        } else {
-            uint32_t header[4] = {SAVE_MAGIC, 1, g.trackSignature(), uint32_t(g.bestGhost.size())};
-            std::fwrite(header, sizeof header, 1, f);
-            std::fwrite(&g.bestTime, sizeof g.bestTime, 1, f);
-            std::fwrite(g.bestSectors, sizeof g.bestSectors, 1, f);
-            std::fwrite(g.bestGhost.data(), sizeof(GhostSample), g.bestGhost.size(), f);
-        }
-        std::rewind(f);
-        Game h;
-        h.init(id);
-        bool loaded = h.readSave(f);
-        std::fclose(f);
-        const float* wantEver = version == SAVE_VERSION ? g.bestEverSectors : g.bestSectors;
-        bool same = loaded && h.bestTime == g.bestTime && h.bestGhost.size() == g.bestGhost.size() &&
-                    h.bestDist.size() == g.bestDist.size() && std::equal(wantEver, wantEver + 3, h.bestEverSectors);
-        std::printf("save v%u round trip: %s\n", version, same ? "ok" : "MISMATCH");
-        ok = ok && same;
-    }
-
-    // A record from one circuit must not load on another.
-    if (TRACK_COUNT > 1) {
-        FILE* f = std::tmpfile();
-        if (!f) return false;
-        g.writeSave(f);
-        std::rewind(f);
-        Game other;
-        other.init((id + 1) % TRACK_COUNT);
-        bool rejected = !other.readSave(f) && other.bestTime < 0;
-        std::fclose(f);
-        std::printf("save rejected on %s: %s\n", TRACKS[other.trackId].name, rejected ? "ok" : "LOADED");
-        ok = ok && rejected;
-    }
-    return ok;
-}
-
-int runSelfTest() {
-    bool ok = true;
-    for (int id = 0; id < TRACK_COUNT; ++id) ok = testTrack(id) && ok;
-
-    // Replaying a best lap drives the puppet all the way round and over the line.
-    {
-        Game g;
-        g.init(0);
-        for (long s = 0; s < 120L * 300 && g.history.empty(); ++s) g.step(autopilot(g));
-        Game rp = g;
-        int topGear = 0, grass = 0;
-        float maxSteer = 0;
-        for (int k = 0; k < int(rp.bestGhost.size()); ++k) {
-            rp.puppetTo(rp.bestGhost, k);
-            topGear = std::max(topGear, rp.gear);
-            grass += rp.onGrass;
-            maxSteer = std::max(maxSteer, std::fabs(rp.car.steer));
-        }
-        bool fine = !g.bestGhost.empty() && topGear >= 6 && grass == 0 && rp.idx < CROSS_BAND && maxSteer <= 1;
-        std::printf("== replay: top gear %d, %d steps on grass, ends at sample %d: %s\n", topGear, grass, rp.idx,
-                    fine ? "ok" : "WRONG");
-        ok = ok && fine;
-    }
-
-    // Turning round just after the line: warn, then abandon the lap on crossing
-    // back, without logging a junk lap.
-    {
-        Game g;
-        g.init(0);
-        g.placeAt(30);
-        g.startLap();
-        g.car.heading += float(M_PI);
-        Input in;
-        in.throttle = 1;
-        bool warned = false;
-        for (int s = 0; s < 240 && g.lapStarted; ++s) {
-            g.step(in);
-            warned = warned || g.wrongWay;
-        }
-        bool abandoned = !g.lapStarted && g.history.empty();
-        std::printf("== reversing over the line: warned %s, abandoned %s\n", warned ? "yes" : "NO",
-                    abandoned ? "yes" : "NO");
-        ok = ok && warned && abandoned;
-    }
-
-    // The synth must stay finite and inside [-1, 1], and get louder on throttle.
-    auto loudness = [](SoundParams p) {
-        Synth s;
-        s.p = p;
-        std::vector<float> buf(48000);
-        s.fill(buf.data(), int(buf.size()));
-        double sum = 0;
-        for (float x : buf) {
-            if (!std::isfinite(x) || std::fabs(x) > 1.0f) return -1.0;
-            sum += double(x) * x;
-        }
-        return std::sqrt(sum / buf.size());
-    };
-    SoundParams idle, flat;
-    idle.volume = flat.volume = 1;
-    flat.rpm = 11500;
-    flat.throttle = 1;
-    flat.speed = 800;
-    flat.slip = 500;
-    flat.kerb = true;
-    flat.wallHits = 1;
-    flat.impact = 900;
-    double rmsIdle = loudness(idle), rmsFlat = loudness(flat);
-    std::printf("== synth rms: idle %.3f, flat out %.3f\n", rmsIdle, rmsFlat);
-    ok = ok && rmsIdle > 0.01 && rmsFlat > rmsIdle;
-
-    std::printf("%s\n", ok ? "SELFTEST PASS" : "SELFTEST FAIL");
-    return ok ? 0 : 1;
-}
-
 // ---------------------------------------------------------------------------
 // Rendering.
 
@@ -1507,10 +1301,11 @@ struct Particle {
 struct Effects {
     std::vector<Particle> parts;
     float shake = 0, smokeAcc = 0, dustAcc = 0;
-    int seenHits = 0;
+    int seenHits = -1;  // -1 until the first update, so old hits don't shake a fresh view
     Rng rng{7u};
 
     void update(const Game& g, float dt) {
+        if (seenHits < 0) seenHits = g.wallHits;
         for (Particle& p : parts) {
             p.age += dt;
             p.pos = p.pos + p.vel * dt;
@@ -2118,6 +1913,231 @@ void updateCamera(View& view, const Game& g, const Settings& set, float frameDt,
     view.cam = set.cameraMode == CAM_LOCKED ? target : view.cam + (target - view.cam) * blend(posRate);
 }
 
+// ---------------------------------------------------------------------------
+// Self-test (--selftest): runs headless, no window or sound device needed.
+
+// Checks one circuit: geometry, three autopilot laps, the delta, gearbox and saves.
+bool testTrack(int id) {
+    Game g;
+    g.init(id);
+    const Track& t = g.track;
+    const int N = t.size();
+    std::printf("== %s: %d samples, %.0f px long\n", TRACKS[id].name, N, t.length);
+
+    // Sections of track that are far apart along the lap must not overlap.
+    float minGap = 1e9f;
+    for (int i = 0; i < N; ++i)
+        for (int j = i + 1; j < N; ++j) {
+            float along = std::min(t.arc[j] - t.arc[i], t.length - (t.arc[j] - t.arc[i]));
+            if (along > 1200.0f) minGap = std::min(minGap, length(t.pts[i] - t.pts[j]));
+        }
+    std::printf("closest separate sections: %.0f px (need > %.0f)\n", minGap, 2 * WALL_D);
+    bool ok = minGap > 2 * WALL_D;
+
+    // Corners tighter than this fold the kerbs and asphalt over themselves.
+    float maxCurv = *std::max_element(t.curvature.begin(), t.curvature.end());
+    const float minRadius = HALF_W + KERB_W + 25;
+    std::printf("tightest corner: %.0f px radius (need > %.0f)\n", 1 / maxCurv, minRadius);
+    ok = ok && 1 / maxCurv > minRadius;
+
+    // The racing line should open the corners up well beyond the centre line,
+    // and stay on the asphalt. Curvature is averaged over 9 samples, as for the centre line.
+    std::vector<float> raw(N);
+    float lineCurv = 0, lineOff = 0;
+    for (int i = 0; i < N; ++i) {
+        Vec2 u = t.line[i] - t.line[(i - 1 + N) % N], v = t.line[(i + 1) % N] - t.line[i];
+        raw[i] = std::fabs(std::atan2(cross(u, v), dot(u, v))) / (0.5f * (length(u) + length(v)));
+        lineOff = std::max(lineOff, std::fabs(dot(t.line[i] - t.pts[i], t.normals[i])));
+    }
+    for (int i = 0; i < N; ++i) {
+        float k = 0;
+        for (int j = -4; j <= 4; ++j) k += raw[((i + j) % N + N) % N];
+        lineCurv = std::max(lineCurv, k / 9);
+    }
+    std::printf("racing line: tightest %.0f px radius (need > 1.3x centre), widest %.0f px off centre (need < %.0f)\n",
+                1 / lineCurv, lineOff, HALF_W);
+    ok = ok && 1 / lineCurv > 1.3f / maxCurv && lineOff < HALF_W;
+
+    // Laps 2 and 3 are driven identically, so the live delta on lap 3 should hover near zero.
+    float maxDelta = 0;
+    int deltaSamples = 0;
+    int topGear = 0, shifts = 0;
+    float rpmLo = 1e9f, rpmHi = 0;
+    for (long s = 0; s < 120L * 600 && g.history.size() < 3; ++s) {
+        int gearBefore = g.gear;
+        g.step(autopilot(g));
+        topGear = std::max(topGear, g.gear);
+        shifts += g.gear != gearBefore;
+        rpmLo = std::min(rpmLo, g.rpm);
+        rpmHi = std::max(rpmHi, g.rpm);
+        float d;
+        if (g.history.size() == 2 && g.liveDelta(d)) {
+            maxDelta = std::max(maxDelta, std::fabs(d));
+            ++deltaSamples;
+        }
+    }
+    for (auto& e : g.history)
+        std::printf("lap %d: %s %s\n", e.number, fmtTime(e.time).c_str(), e.valid ? "valid" : "INVALID");
+    bool allValid = g.history.size() == 3;
+    for (auto& e : g.history) allValid = allValid && e.valid;
+    ok = ok && allValid && g.bestGhost.size() > 0;
+    std::printf("best: %s, ghost samples: %zu\n", fmtTime(g.bestTime).c_str(), g.bestGhost.size());
+
+    std::printf("lap 3 live delta: max %.3f s over %d samples (need < 0.05)\n", maxDelta, deltaSamples);
+    ok = ok && deltaSamples > int(g.bestGhost.size() * 9 / 10) && maxDelta < 0.05f;
+    float ideal = g.idealLap();
+    std::printf("ideal lap: %s (need <= best)\n", fmtTime(ideal).c_str());
+    ok = ok && ideal > 0 && ideal <= g.bestTime + 1e-4f;
+
+    std::printf("gearbox: top gear %d, %d shifts, rpm %.0f-%.0f\n", topGear, shifts, rpmLo, rpmHi);
+    ok = ok && topGear >= 5 && shifts >= topGear && rpmLo >= IDLE_RPM - 1 && rpmHi <= MAX_RPM + 1;
+
+    // Every circuit has DRS on at least one straight, and using it saves time.
+    int zones = 0;
+    float zoneLen = 0;
+    for (int i = 0; i < N; ++i) {
+        zones += t.drsZone[i] && !t.drsZone[(i - 1 + N) % N];
+        if (t.drsZone[i]) zoneLen += length(t.pts[(i + 1) % N] - t.pts[i]);
+    }
+    Game noDrs;
+    noDrs.init(id);
+    for (long s = 0; s < 120L * 600 && noDrs.history.size() < 2; ++s) noDrs.step(autopilot(noDrs, false));
+    std::printf("drs: %d zone(s), %.0f px; best lap %s with it, %s without\n", zones, zoneLen,
+                fmtTime(g.bestTime).c_str(), fmtTime(noDrs.bestTime).c_str());
+    ok = ok && zones >= 1 && noDrs.bestTime > g.bestTime;
+
+    // Save round trip, in the current format and the old v1 one (no best-ever sectors).
+    for (uint32_t version : {SAVE_VERSION, 1u}) {
+        FILE* f = std::tmpfile();
+        if (!f) return false;
+        if (version == SAVE_VERSION) {
+            g.writeSave(f);
+        } else {
+            uint32_t header[4] = {SAVE_MAGIC, 1, g.trackSignature(), uint32_t(g.bestGhost.size())};
+            std::fwrite(header, sizeof header, 1, f);
+            std::fwrite(&g.bestTime, sizeof g.bestTime, 1, f);
+            std::fwrite(g.bestSectors, sizeof g.bestSectors, 1, f);
+            std::fwrite(g.bestGhost.data(), sizeof(GhostSample), g.bestGhost.size(), f);
+        }
+        std::rewind(f);
+        Game h;
+        h.init(id);
+        bool loaded = h.readSave(f);
+        std::fclose(f);
+        const float* wantEver = version == SAVE_VERSION ? g.bestEverSectors : g.bestSectors;
+        bool same = loaded && h.bestTime == g.bestTime && h.bestGhost.size() == g.bestGhost.size() &&
+                    h.bestDist.size() == g.bestDist.size() && std::equal(wantEver, wantEver + 3, h.bestEverSectors);
+        std::printf("save v%u round trip: %s\n", version, same ? "ok" : "MISMATCH");
+        ok = ok && same;
+    }
+
+    // A record from one circuit must not load on another.
+    if (TRACK_COUNT > 1) {
+        FILE* f = std::tmpfile();
+        if (!f) return false;
+        g.writeSave(f);
+        std::rewind(f);
+        Game other;
+        other.init((id + 1) % TRACK_COUNT);
+        bool rejected = !other.readSave(f) && other.bestTime < 0;
+        std::fclose(f);
+        std::printf("save rejected on %s: %s\n", TRACKS[other.trackId].name, rejected ? "ok" : "LOADED");
+        ok = ok && rejected;
+    }
+    return ok;
+}
+
+int runSelfTest() {
+    bool ok = true;
+    for (int id = 0; id < TRACK_COUNT; ++id) ok = testTrack(id) && ok;
+
+    // Replaying a best lap drives the puppet all the way round and over the line.
+    {
+        Game g;
+        g.init(0);
+        for (long s = 0; s < 120L * 300 && g.history.empty(); ++s) g.step(autopilot(g));
+        Game rp = g;
+        int topGear = 0, grass = 0;
+        float maxSteer = 0;
+        for (int k = 0; k < int(rp.bestGhost.size()); ++k) {
+            rp.puppetTo(rp.bestGhost, k);
+            topGear = std::max(topGear, rp.gear);
+            grass += rp.onGrass;
+            maxSteer = std::max(maxSteer, std::fabs(rp.car.steer));
+        }
+        bool fine = !g.bestGhost.empty() && topGear >= 6 && grass == 0 && rp.idx < CROSS_BAND && maxSteer <= 1;
+        std::printf("== replay: top gear %d, %d steps on grass, ends at sample %d: %s\n", topGear, grass, rp.idx,
+                    fine ? "ok" : "WRONG");
+        ok = ok && fine;
+    }
+
+    // Fresh effects (after a replay or track change) must not shake for old wall hits.
+    {
+        Game g;
+        g.init(0);
+        g.wallHits = 5;
+        g.lastImpact = 500;
+        Effects fx;
+        fx.update(g, DT);
+        bool calm = fx.shake == 0;
+        ++g.wallHits;
+        fx.update(g, DT);
+        bool shook = fx.shake > 0;
+        std::printf("== camera shake: %s on old hits, %s on a new one\n", calm ? "none" : "SHOOK", shook ? "shakes" : "NONE");
+        ok = ok && calm && shook;
+    }
+
+    // Turning round just after the line: warn, then abandon the lap on crossing
+    // back, without logging a junk lap.
+    {
+        Game g;
+        g.init(0);
+        g.placeAt(30);
+        g.startLap();
+        g.car.heading += float(M_PI);
+        Input in;
+        in.throttle = 1;
+        bool warned = false;
+        for (int s = 0; s < 240 && g.lapStarted; ++s) {
+            g.step(in);
+            warned = warned || g.wrongWay;
+        }
+        bool abandoned = !g.lapStarted && g.history.empty();
+        std::printf("== reversing over the line: warned %s, abandoned %s\n", warned ? "yes" : "NO",
+                    abandoned ? "yes" : "NO");
+        ok = ok && warned && abandoned;
+    }
+
+    // The synth must stay finite and inside [-1, 1], and get louder on throttle.
+    auto loudness = [](SoundParams p) {
+        Synth s;
+        s.p = p;
+        std::vector<float> buf(48000);
+        s.fill(buf.data(), int(buf.size()));
+        double sum = 0;
+        for (float x : buf) {
+            if (!std::isfinite(x) || std::fabs(x) > 1.0f) return -1.0;
+            sum += double(x) * x;
+        }
+        return std::sqrt(sum / buf.size());
+    };
+    SoundParams idle, flat;
+    idle.volume = flat.volume = 1;
+    flat.rpm = 11500;
+    flat.throttle = 1;
+    flat.speed = 800;
+    flat.slip = 500;
+    flat.kerb = true;
+    flat.wallHits = 1;
+    flat.impact = 900;
+    double rmsIdle = loudness(idle), rmsFlat = loudness(flat);
+    std::printf("== synth rms: idle %.3f, flat out %.3f\n", rmsIdle, rmsFlat);
+    ok = ok && rmsIdle > 0.01 && rmsFlat > rmsIdle;
+
+    std::printf("%s\n", ok ? "SELFTEST PASS" : "SELFTEST FAIL");
+    return ok ? 0 : 1;
+}
+
 int runGame() {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -2332,8 +2352,10 @@ int runGame() {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             // Don't keep the clock running while the player is in another window.
-            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_FOCUS_LOST && !menu.open && !title)
-                paused = true;
+            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_FOCUS_LOST && !menu.open && !title) {
+                if (replaying) replayPaused = true;  // P resumes a replay, so pause that
+                else paused = true;
+            }
             if (e.type == SDL_KEYDOWN && menu.open) {
                 switch (e.key.keysym.scancode) {
                     case SDL_SCANCODE_ESCAPE: toggleMenu(); break;
