@@ -428,6 +428,7 @@ struct Game {
     float bestEverSectors[3] = {};  // fastest each sector has been driven on a valid lap
     float lapDist = 0;              // distance along the track, continuous through the lap
     std::vector<GhostSample> bestGhost, curGhost;
+    std::vector<GhostSample> aiGhost;  // the autopilot's lap, for the AI ghost (not saved)
     std::vector<float> bestDist;  // best lap's distance at each step, as a running max
     std::vector<LapEntry> history;
     std::vector<Vec2> skids;
@@ -1005,6 +1006,18 @@ Input autopilot(const Game& g, bool useDrs = true) {
     return in;
 }
 
+// The autopilot's lap on a copy of the game (its faster of two, so a flying
+// lap), for the AI ghost. Nothing is saved.
+std::vector<GhostSample> aiLapGhost(const Game& from) {
+    Game g = from;
+    g.savePath.clear();
+    g.resetBest();
+    g.history.clear();
+    g.resetToGrid();
+    for (long s = 0; s < 120L * 300 && g.history.size() < 2; ++s) g.step(autopilot(g));
+    return g.bestGhost;
+}
+
 // ---------------------------------------------------------------------------
 // Rendering.
 
@@ -1453,6 +1466,9 @@ enum CameraMode { CAM_FOLLOW, CAM_CHASE, CAM_LOCKED, CAM_HELICOPTER, CAM_COUNT }
 const char* CAMERA_NAMES[CAM_COUNT] = {"FOLLOW", "CHASE", "LOCKED", "HELICOPTER"};
 
 const char* cameraName(int i) { return CAMERA_NAMES[i]; }
+enum GhostBits { GHOST_BEST = 1, GHOST_AI = 2 };  // Settings::ghost is a mask of these
+const char* GHOST_NAMES[] = {"OFF", "BEST LAP", "AI", "BEST + AI"};
+const char* ghostName(int i) { return GHOST_NAMES[i]; }
 const char* trackName(int i) { return TRACKS[i].name; }
 
 struct MenuEntry {
@@ -1477,7 +1493,7 @@ const MenuEntry MENU[] = {
     {"SPEED UNITS", "mph", &Settings::mph, 0, 1, 1, Kind::Units},
     {"SOUND VOLUME", "volume", &Settings::volume, 0, 100, 10, Kind::Percent},
     {"RACING LINE", "racing_line", &Settings::racingLine, 0, 1, 1, Kind::Toggle},
-    {"GHOST CAR", "ghost", &Settings::ghost, 0, 1, 1, Kind::Toggle},
+    {"GHOST CAR", "ghost", &Settings::ghost, 0, 3, 1, Kind::Choice, ghostName},
     {"MINIMAP", "minimap", &Settings::minimap, 0, 1, 1, Kind::Toggle},
     {"SKID MARKS", "skid_marks", &Settings::skidMarks, 0, 1, 1, Kind::Toggle},
     {"FULLSCREEN", "fullscreen", &Settings::fullscreen, 0, 1, 1, Kind::Toggle},
@@ -1572,9 +1588,15 @@ void drawMenu(SDL_Renderer* r, const Menu& menu, const Settings& s) {
              {170, 170, 170, 255}, 1);
 }
 
+// Where a recorded lap's car is at this point of the current lap, if it's still going.
+const GhostSample* ghostSample(const Game& g, const std::vector<GhostSample>& ghost) {
+    return g.lapStarted && g.lapSteps < int(ghost.size()) ? &ghost[g.lapSteps] : nullptr;
+}
+const SDL_Color BEST_GHOST{150, 200, 255, 255}, AI_GHOST{255, 200, 60, 255};
+
 // The world: ground, track, scenery, skid marks, racing line, smoke and cars.
 void drawWorld(SDL_Renderer* r, const Game& g, const View& view, const std::vector<WorldQuad>& quads,
-               const Settings& set, bool showGhost, const Effects& fx, std::vector<SDL_Vertex>& verts) {
+               const Settings& set, int ghosts, const Effects& fx, std::vector<SDL_Vertex>& verts) {
     SDL_SetRenderDrawColor(r, 40, 96, 48, 255);
     SDL_RenderClear(r);
 
@@ -1648,12 +1670,11 @@ void drawWorld(SDL_Renderer* r, const Game& g, const View& view, const std::vect
         pushQuad(verts, c + Vec2{-s, -s}, c + Vec2{s, -s}, c + Vec2{s, s}, c + Vec2{-s, s}, col);
     }
 
-    // Ghost of the best lap, then the player.
-    bool ghostVisible = showGhost && g.lapStarted && g.lapSteps < int(g.bestGhost.size());
-    if (ghostVisible) {
-        const GhostSample& s = g.bestGhost[g.lapSteps];
-        pushCar(verts, view, {s.x, s.y}, s.h, 0, {150, 200, 255, 255}, 90);
-    }
+    // Ghosts (the AI's lap in gold, your best in blue), then the player.
+    if (ghosts & GHOST_AI)
+        if (const GhostSample* s = ghostSample(g, g.aiGhost)) pushCar(verts, view, {s->x, s->y}, s->h, 0, AI_GHOST, 90);
+    if (ghosts & GHOST_BEST)
+        if (const GhostSample* s = ghostSample(g, g.bestGhost)) pushCar(verts, view, {s->x, s->y}, s->h, 0, BEST_GHOST, 90);
     pushCarShadow(verts, view, g.car.pos, g.car.heading);
     pushCar(verts, view, g.car.pos, g.car.heading, g.car.steer, {220, 30, 40, 255}, 255, g.drsOpen);
     SDL_RenderGeometry(r, nullptr, verts.data(), int(verts.size()), nullptr, 0);
@@ -1662,7 +1683,7 @@ void drawWorld(SDL_Renderer* r, const Game& g, const View& view, const std::vect
 // Everything over the world: minimap, timing, dash, banners and hints.
 void drawHud(SDL_Renderer* r, const Game& g, const Minimap& mini, const Settings& set, const Menu& menu,
              bool paused, bool replay, bool replayPaused) {
-    bool ghostVisible = set.ghost && !replay && g.lapStarted && g.lapSteps < int(g.bestGhost.size());
+    int ghosts = replay ? 0 : set.ghost;
 
     // Minimap.
     if (set.minimap) {
@@ -1682,10 +1703,11 @@ void drawHud(SDL_Renderer* r, const Game& g, const Minimap& mini, const Settings
             }
         SDL_FPoint sl = mini.map(g.track.pts[0]);
         fillRect(r, sl.x - 2, sl.y - 5, 4, 10, WHITE);
-        if (ghostVisible) {
-            const GhostSample& s = g.bestGhost[g.lapSteps];
-            SDL_FPoint p = mini.map({s.x, s.y});
-            fillRect(r, p.x - 3, p.y - 3, 6, 6, {150, 200, 255, 255});
+        for (int bit : {GHOST_AI, GHOST_BEST}) {
+            const GhostSample* s = ghosts & bit ? ghostSample(g, bit == GHOST_AI ? g.aiGhost : g.bestGhost) : nullptr;
+            if (!s) continue;
+            SDL_FPoint p = mini.map({s->x, s->y});
+            fillRect(r, p.x - 3, p.y - 3, 6, 6, bit == GHOST_AI ? AI_GHOST : BEST_GHOST);
         }
         SDL_FPoint cp = mini.map(g.car.pos);
         fillRect(r, cp.x - 4, cp.y - 4, 8, 8, RED);
@@ -1900,7 +1922,7 @@ void drawTitle(SDL_Renderer* r, const std::vector<TitleCard>& cards, int sel, lo
 void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<WorldQuad>& quads,
             const Minimap& mini, const Settings& set, const Menu& menu, bool paused, bool replay,
             bool replayPaused, const Effects& fx, std::vector<SDL_Vertex>& verts) {
-    drawWorld(r, g, view, quads, set, set.ghost && !replay, fx, verts);  // in a replay the car is the ghost
+    drawWorld(r, g, view, quads, set, replay ? 0 : set.ghost, fx, verts);  // in a replay the car is the ghost
     drawHud(r, g, mini, set, menu, paused, replay, replayPaused);
     if (menu.open) drawMenu(r, menu, set);
 }
@@ -2092,6 +2114,13 @@ bool testTrack(int id) {
     std::printf("medals: autopilot %s vs aiLap %s (%.2f%% off, need < 1%%), earned %s\n", fmtTime(g.bestTime).c_str(),
                 fmtTime(TRACKS[id].aiLap).c_str(), drift * 100, MEDAL_NAMES[medalFor(id, g.bestTime)]);
     ok = ok && drift < 0.01f && medalFor(id, g.bestTime) == MEDAL_GOLD;
+
+    // The AI ghost is that same pace, recorded from a fresh session.
+    Game fresh;
+    fresh.init(id);
+    float aiGhostLap = aiLapGhost(fresh).size() * DT;
+    std::printf("ai ghost: %s (need within 1%% of aiLap)\n", fmtTime(aiGhostLap).c_str());
+    ok = ok && std::fabs(aiGhostLap - TRACKS[id].aiLap) / TRACKS[id].aiLap < 0.01f && fresh.history.empty();
 
     // Save round trip, in the current format and the old v1 one (no best-ever sectors).
     for (uint32_t version : {SAVE_VERSION, 1u}) {
@@ -2286,6 +2315,7 @@ int runGame() {
         game = Game{};
         if (!basePath.empty()) game.savePath = basePath + TRACKS[set.track].saveFile;
         game.init(set.track);
+        game.aiGhost = aiLapGhost(game);
         demo = game;
         demo.savePath.clear();
         demo.resetToGrid();
@@ -2501,7 +2531,11 @@ int runGame() {
                     case SDL_SCANCODE_R:
                     case SDL_SCANCODE_RETURN: restartLap(); break;
                     case SDL_SCANCODE_C: cycleCamera(); break;
-                    case SDL_SCANCODE_G: set.ghost = !set.ghost; changed(); break;
+                    case SDL_SCANCODE_G:
+                        set.ghost = (set.ghost + 1) % 4;
+                        changed();
+                        game.flash(std::string("GHOST: ") + GHOST_NAMES[set.ghost], WHITE, 1.5f);
+                        break;
                     case SDL_SCANCODE_L: set.racingLine = !set.racingLine; changed(); break;
                     case SDL_SCANCODE_P: paused = !paused; break;
                     case SDL_SCANCODE_F11: set.fullscreen = !set.fullscreen; changed(); break;
@@ -2615,7 +2649,7 @@ int runGame() {
 
         if (title) {
             cards[set.track].best = game.bestTime;  // in case it was reset from the menu
-            drawWorld(r, demo, shown, quads, set, false, fx, verts);
+            drawWorld(r, demo, shown, quads, set, 0, fx, verts);
             drawTitle(r, cards, set.track, demo.stepCount);
             if (menu.open) drawMenu(r, menu, set);
         } else {

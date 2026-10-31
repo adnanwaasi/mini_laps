@@ -65,7 +65,7 @@ Your medal and the time for the next one show in the timing panel and on the tit
 | Restart lap (back behind the line, timer cleared) | R / Enter | B / Start |
 | Cycle camera mode | C | Y |
 | Settings menu | Esc | Back |
-| Toggle ghost | G | |
+| Cycle ghost: off / best lap / AI / both | G | |
 | Toggle racing line | L | |
 | Watch your best lap | V | |
 | Pause | P | |
@@ -89,7 +89,8 @@ Press **Esc** to open the settings menu; the game pauses while it's open. With t
 | Speed units | km/h / mph | |
 | Sound volume | 0–100% | 0 turns the sound off |
 | Racing line | on/off | Shows the fastest line ahead (also L). Green: accelerate, yellow: at the grip limit, red: brake |
-| Ghost car, minimap, skid marks | on/off | |
+| Ghost car | Off / Best lap / AI / Best + AI | Blue is your best lap; gold is the autopilot's lap (just quicker than gold-medal pace) |
+| Minimap, skid marks | on/off | |
 | Fullscreen, VSync | on/off | |
 | Reset best lap | | Click or press Enter twice to wipe your record and ghost |
 
