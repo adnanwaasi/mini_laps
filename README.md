@@ -2,7 +2,7 @@
 
 A lightweight top-down time-trial racer in C++ with SDL2. Drive laps around the circuit, stay inside the track limits, and chase your best lap. Your best lap is saved, and a ghost car replays it while you drive.
 
-The whole game is one source file (`src/main.cpp`) with SDL2 as its only dependency. It has no image or font assets.
+The whole game is one source file (`src/main.cpp`) with SDL2 as its only dependency. It has no image, font or sound assets: the engine note, tyre squeal, kerb rumble and impacts are all synthesised as you drive.
 
 ## Build & run
 
@@ -59,6 +59,7 @@ Press **Esc** to open the settings menu; the game pauses while it's open. With t
 | Camera look-ahead | 0–150% | How far the camera leads the car in the direction you're going |
 | Zoom out with speed | on/off | Pulls the camera back at high speed |
 | Speed units | km/h / mph | |
+| Sound volume | 0–100% | 0 turns the sound off |
 | Ghost car, minimap, skid marks | on/off | |
 | Fullscreen, VSync | on/off | |
 | Reset best lap | | Click or press Enter twice to wipe your record and ghost |
@@ -73,6 +74,10 @@ The menu also has Resume and Quit.
 - **Helicopter:** a high, wide view that shows the corners well in advance.
 
 Camera zoom applies in every mode. Look-ahead and zoom out with speed apply where they make sense.
+
+## HUD
+
+The dash at the bottom shows speed, gear and throttle/brake bars. The 15 rev lights fill green, red, then blue as the revs rise, and flash blue at the shift point. The gearbox is automatic.
 
 ## Rules
 

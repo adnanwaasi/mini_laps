@@ -34,6 +34,11 @@ constexpr float BRAKE = 1350.0f;
 constexpr float MAX_LAT = 1500.0f;  // lateral grip limit
 constexpr float WHEELBASE = 32.0f;
 
+// Gearbox. It's cosmetic: it drives the HUD, rev lights and engine note, not the physics.
+constexpr int GEARS = 8;
+constexpr float IDLE_RPM = 4000, MAX_RPM = 12000, SHIFT_RPM = 11600, DOWNSHIFT_RPM = 9000;
+constexpr float GEAR_TOP[GEARS] = {250, 340, 420, 500, 580, 660, 750, 845};  // speed at MAX_RPM
+
 struct Vec2 {
     float x = 0, y = 0;
     Vec2 operator+(Vec2 o) const { return {x + o.x, y + o.y}; }
@@ -202,7 +207,11 @@ struct Game {
     Car car;
     int idx = 0;
     int cpIdx[2] = {};
-    bool lapStarted = false, lapValid = true, offTrack = false, onGrass = false;
+    bool lapStarted = false, lapValid = true, offTrack = false, onGrass = false, onKerb = false;
+    int gear = 0;  // -1 reverse, 0 neutral, 1..GEARS
+    float rpm = IDLE_RPM;
+    int wallHits = 0;
+    float lastImpact = 0;  // speed into the wall on the latest hit
     int nextCp = 3, lapSteps = 0, lapNumber = 0, splitsDone = 0;
     float splits[3] = {}, lastSplits[3] = {};
     float bestTime = -1, bestSectors[3] = {}, lastLap = -1;
@@ -236,8 +245,30 @@ struct Game {
         messageTimer = secs;
     }
 
+    void updateGearbox(float vf, float throttle) {
+        float v = std::fabs(vf);
+        if (vf < -5) {
+            gear = -1;
+        } else if (v < 3 && throttle == 0) {
+            gear = 0;
+        } else {
+            gear = std::max(gear, 1);
+            while (gear < GEARS && v > GEAR_TOP[gear - 1] * SHIFT_RPM / MAX_RPM) ++gear;
+            while (gear > 1 && v < GEAR_TOP[gear - 2] * DOWNSHIFT_RPM / MAX_RPM) --gear;
+        }
+        float target = gear > 0    ? MAX_RPM * v / GEAR_TOP[gear - 1]
+                       : gear < 0 ? IDLE_RPM + 6000.0f * v / REVERSE_SPEED
+                                  : IDLE_RPM;
+        // Clutch slip off the line, and free revs in neutral.
+        float free = IDLE_RPM + throttle * (gear == 0 ? 7000.0f : gear == 1 ? 3500.0f : 0.0f);
+        target = std::clamp(std::max(target, free), IDLE_RPM, MAX_RPM);
+        rpm += (target - rpm) * (1.0f - std::exp(-25.0f * DT));
+    }
+
     void placeAt(int i) {
         car = Car{};
+        gear = 0;
+        rpm = IDLE_RPM;
         car.pos = track.pts[i];
         Vec2 t = track.tangent(i);
         car.heading = std::atan2(t.y, t.x);
@@ -370,6 +401,7 @@ struct Game {
 
         TrackHit here = track.nearest(car.pos, idx, 40);
         onGrass = here.dist > HALF_W + KERB_W;
+        onKerb = here.dist > HALF_W && !onGrass;
         float grip = onGrass ? 0.5f : 1.0f;
         float top = onGrass ? GRASS_TOP : TOP_SPEED;
 
@@ -401,6 +433,7 @@ struct Game {
         vr += std::clamp(-vr * (1.0f - std::exp(-28.0f * DT)), -cap, cap);
         vf -= signOf(vf) * std::min(std::fabs(vf), std::fabs(vr) * 0.6f * DT);
         car.slip = vr;
+        updateGearbox(vf, in.throttle);
 
         // Velocity is rebuilt in the pre-turn frame, so turning creates slip next step.
         car.vel = fwd * vf + right * vr;
@@ -420,6 +453,10 @@ struct Game {
             float vn = dot(car.vel, n);
             if (vn > 0) car.vel = car.vel - n * (vn * 1.3f);
             car.vel = car.vel * 0.55f;
+            if (vn > 40) {
+                ++wallHits;
+                lastImpact = vn;
+            }
         }
 
         const int N = track.size();
@@ -515,6 +552,121 @@ struct Game {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Sound: everything is synthesised, so there are still no asset files.
+
+struct SoundParams {
+    float rpm = IDLE_RPM, throttle = 0, slip = 0, speed = 0, volume = 0, impact = 0;
+    bool kerb = false, grass = false;
+    int wallHits = 0;
+};
+
+SoundParams soundParams(const Game& g, float volume) {
+    SoundParams p;
+    p.rpm = g.rpm;
+    p.throttle = g.lastInput.throttle;
+    p.slip = std::fabs(g.car.slip);
+    p.speed = length(g.car.vel);
+    p.volume = volume;
+    p.kerb = g.onKerb;
+    p.grass = g.onGrass;
+    p.wallHits = g.wallHits;
+    p.impact = g.lastImpact;
+    return p;
+}
+
+struct Synth {
+    SoundParams p;  // written by the game thread under SDL_LockAudioDevice
+    float rate = 48000;
+    float phase = 0, subPhase = 0, rpm = IDLE_RPM, throttle = 0, gain = 0;
+    float engineLp = 0, grassLp = 0, kerbLp = 0, kerbPhase = 0;
+    float squeal = 0, squealPhase = 0, vibPhase = 0;
+    float pop = 0, thump = 0, thumpTime = 0;
+    int seenHits = 0;
+    uint32_t seed = 0x9E3779B9u;
+
+    float noise() {
+        seed = seed * 1664525u + 1013904223u;
+        return float(seed >> 8) * (2.0f / 16777216.0f) - 1.0f;
+    }
+
+    void fill(float* out, int n) {
+        const float TAU = 2.0f * float(M_PI), dt = 1.0f / rate;
+        auto coef = [&](float hz) { return 1.0f - std::exp(-hz * dt); };
+        const float kRpm = coef(30), kThrottle = coef(15), kGain = coef(8), kSqueal = coef(12);
+        const float kPop = std::exp(-45.0f * dt), kThump = std::exp(-14.0f * dt);
+        const float kGrass = coef(TAU * 250), kKerb = coef(TAU * 180);
+        if (p.wallHits != seenHits) {
+            seenHits = p.wallHits;
+            thump = std::clamp(p.impact / 400.0f, 0.3f, 1.0f);
+            thumpTime = 0;
+        }
+        float squealTarget = p.speed > 60 ? std::clamp((p.slip - 120.0f) / 350.0f, 0.0f, 1.0f) : 0.0f;
+        float speedAmt = std::min(p.speed / 300.0f, 1.0f);
+
+        for (int i = 0; i < n; ++i) {
+            rpm += (p.rpm - rpm) * kRpm;
+            throttle += (p.throttle - throttle) * kThrottle;
+            gain += (p.volume - gain) * kGain;
+            squeal += (squealTarget - squeal) * kSqueal;
+
+            // Engine: a V6 fires three times per revolution. A few harmonics plus a
+            // half-order rumble, roughened with combustion noise and low-passed.
+            float f = rpm / 60.0f * 3.0f;
+            phase += f * dt;
+            phase -= std::floor(phase);
+            subPhase += 0.5f * f * dt;
+            subPhase -= std::floor(subPhase);
+            float x = std::sin(TAU * phase) + 0.6f * std::sin(2 * TAU * phase + 0.5f) +
+                      0.35f * std::sin(3 * TAU * phase + 1.1f) + 0.45f * std::sin(TAU * subPhase);
+            x += noise() * (0.25f + 0.5f * throttle) * (1.0f - phase);
+            float cutoff = 600.0f + 2600.0f * throttle + rpm * 0.12f;
+            engineLp += (x - engineLp) * std::min(1.0f, TAU * cutoff * dt);
+            float mix = engineLp * (0.18f + 0.32f * throttle);
+
+            // Crackles on the overrun.
+            if (throttle < 0.2f && rpm > 7000 && noise() > 0.9993f) pop = 0.5f + 0.5f * std::fabs(noise());
+            mix += pop * noise() * 0.5f;
+            pop *= kPop;
+
+            // Tyre squeal: two detuned partials with a little vibrato.
+            if (squeal > 0.001f) {
+                vibPhase += 7.0f * dt;
+                squealPhase += (950.0f + 50.0f * std::sin(TAU * vibPhase)) * dt;
+                squealPhase -= std::floor(squealPhase);
+                mix += squeal * 0.16f * (std::sin(TAU * squealPhase) + 0.5f * std::sin(TAU * squealPhase * 1.51f));
+            }
+
+            // Kerb rumble: a buzz at the rate the stripes pass under the tyres.
+            float kerbIn = 0;
+            if (p.kerb && p.speed > 40) {
+                kerbPhase += p.speed / 24.0f * dt;
+                kerbPhase -= std::floor(kerbPhase);
+                kerbIn = kerbPhase < 0.5f ? 1.0f : -1.0f;
+            }
+            kerbLp += (kerbIn - kerbLp) * kKerb;
+            mix += kerbLp * 0.45f;
+
+            // Grass: low, rough noise.
+            grassLp += ((p.grass ? noise() * speedAmt : 0.0f) - grassLp) * kGrass;
+            mix += grassLp * 1.2f;
+
+            // Wall impact: a short low thud.
+            if (thump > 0.001f) {
+                mix += thump * (std::sin(TAU * 55.0f * thumpTime) + 0.4f * noise()) * 0.8f;
+                thump *= kThump;
+                thumpTime += dt;
+            }
+
+            out[i] = std::tanh(mix * gain * 1.2f) * 0.9f;
+        }
+    }
+};
+
+void audioCallback(void* userdata, Uint8* stream, int len) {
+    static_cast<Synth*>(userdata)->fill(reinterpret_cast<float*>(stream), len / int(sizeof(float)));
+}
+
 // Simple pure-pursuit driver used by --selftest to check the game is lappable.
 Input autopilot(const Game& g) {
     const Track& t = g.track;
@@ -560,8 +712,15 @@ int runSelfTest() {
     // Laps 2 and 3 are driven identically, so the live delta on lap 3 should hover near zero.
     float maxDelta = 0;
     int deltaSamples = 0;
+    int topGear = 0, shifts = 0;
+    float rpmLo = 1e9f, rpmHi = 0;
     for (long s = 0; s < 120L * 600 && g.history.size() < 3; ++s) {
+        int gearBefore = g.gear;
         g.step(autopilot(g));
+        topGear = std::max(topGear, g.gear);
+        shifts += g.gear != gearBefore;
+        rpmLo = std::min(rpmLo, g.rpm);
+        rpmHi = std::max(rpmHi, g.rpm);
         float d;
         if (g.history.size() == 2 && g.liveDelta(d)) {
             maxDelta = std::max(maxDelta, std::fabs(d));
@@ -580,6 +739,35 @@ int runSelfTest() {
     float ideal = g.idealLap();
     std::printf("ideal lap: %s (need <= best)\n", fmtTime(ideal).c_str());
     ok = ok && ideal > 0 && ideal <= g.bestTime + 1e-4f;
+
+    std::printf("gearbox: top gear %d, %d shifts, rpm %.0f-%.0f\n", topGear, shifts, rpmLo, rpmHi);
+    ok = ok && topGear >= 6 && shifts >= 20 && rpmLo >= IDLE_RPM - 1 && rpmHi <= MAX_RPM + 1;
+
+    // The synth must stay finite and inside [-1, 1], and get louder on throttle.
+    auto loudness = [](SoundParams p) {
+        Synth s;
+        s.p = p;
+        std::vector<float> buf(48000);
+        s.fill(buf.data(), int(buf.size()));
+        double sum = 0;
+        for (float x : buf) {
+            if (!std::isfinite(x) || std::fabs(x) > 1.0f) return -1.0;
+            sum += double(x) * x;
+        }
+        return std::sqrt(sum / buf.size());
+    };
+    SoundParams idle, flat;
+    idle.volume = flat.volume = 1;
+    flat.rpm = 11500;
+    flat.throttle = 1;
+    flat.speed = 800;
+    flat.slip = 500;
+    flat.kerb = true;
+    flat.wallHits = 1;
+    flat.impact = 900;
+    double rmsIdle = loudness(idle), rmsFlat = loudness(flat);
+    std::printf("synth rms: idle %.3f, flat out %.3f\n", rmsIdle, rmsFlat);
+    ok = ok && rmsIdle > 0.01 && rmsFlat > rmsIdle;
 
     // Save round trip, in the current format and the old v1 one (no best-ever sectors).
     for (uint32_t version : {SAVE_VERSION, 1u}) {
@@ -814,6 +1002,7 @@ struct Settings {
     int steerSensitivity = 100, steerSpeed = 100, padDeadzone = 12, cameraZoom = 100, lookAhead = 100;
     int cameraMode = 0;
     int speedZoom = 1, mph = 0, ghost = 1, minimap = 1, skidMarks = 1, fullscreen = 0, vsync = 1;
+    int volume = 70;
 };
 
 enum class Kind { Percent, Choice, Toggle, Units, ResetBest, Resume, Quit };
@@ -838,6 +1027,7 @@ const MenuEntry MENU[] = {
     {"CAMERA LOOK-AHEAD", "look_ahead", &Settings::lookAhead, 0, 150, 10, Kind::Percent},
     {"ZOOM OUT WITH SPEED", "speed_zoom", &Settings::speedZoom, 0, 1, 1, Kind::Toggle},
     {"SPEED UNITS", "mph", &Settings::mph, 0, 1, 1, Kind::Units},
+    {"SOUND VOLUME", "volume", &Settings::volume, 0, 100, 10, Kind::Percent},
     {"GHOST CAR", "ghost", &Settings::ghost, 0, 1, 1, Kind::Toggle},
     {"MINIMAP", "minimap", &Settings::minimap, 0, 1, 1, Kind::Toggle},
     {"SKID MARKS", "skid_marks", &Settings::skidMarks, 0, 1, 1, Kind::Toggle},
@@ -876,7 +1066,7 @@ struct Menu {
 };
 
 // Menu geometry, shared by drawing and mouse hit-testing.
-constexpr float MENU_X = 270, MENU_W = 740, MENU_Y = 50, MENU_ROW = 32;
+constexpr float MENU_X = 270, MENU_W = 740, MENU_Y = 24, MENU_ROW = 30;
 constexpr float MENU_VALUE_RIGHT = MENU_X + MENU_W - 30;
 float menuRowY(int i) { return MENU_Y + 80 + i * MENU_ROW; }
 
@@ -912,7 +1102,7 @@ int menuArrowAt(const MenuEntry& m, const Settings& s, const Menu& menu, float x
 
 void drawMenu(SDL_Renderer* r, const Menu& menu, const Settings& s) {
     fillRect(r, 0, 0, SCREEN_W, SCREEN_H, {0, 0, 0, 110});
-    fillRect(r, MENU_X, MENU_Y, MENU_W, 80 + MENU_COUNT * MENU_ROW + 50, {10, 10, 16, 235});
+    fillRect(r, MENU_X, MENU_Y, MENU_W, 80 + MENU_COUNT * MENU_ROW + 44, {10, 10, 16, 235});
     drawText(r, SCREEN_W / 2, MENU_Y + 22, 5, "SETTINGS", GOLD, 1);
     for (int i = 0; i < MENU_COUNT; ++i) {
         const MenuEntry& m = MENU[i];
@@ -925,7 +1115,7 @@ void drawMenu(SDL_Renderer* r, const Menu& menu, const Settings& s) {
                                                                 : WHITE;
         drawText(r, MENU_VALUE_RIGHT, y, 3, menuValue(m, s, menu), c, 2);
     }
-    drawText(r, SCREEN_W / 2, menuRowY(MENU_COUNT) - 18, 2,
+    drawText(r, SCREEN_W / 2, menuRowY(MENU_COUNT) + 6, 2,
              "CLICK < > OR SCROLL TO CHANGE   CLICK TO TOGGLE   KEYS: ARROWS + ENTER   ESC CLOSE",
              {170, 170, 170, 255}, 1);
 }
@@ -1047,19 +1237,35 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
         }
     }
 
-    // Speedo with throttle / brake bars.
+    // Speedo: rev lights, speed, gear, and throttle / brake bars.
     Vec2 fwd{std::cos(g.car.heading), std::sin(g.car.heading)};
     float vf = dot(g.car.vel, fwd);
-    int kmh = int(std::fabs(vf) * 0.36f + 0.5f);
-    int shownSpeed = set.mph ? int(std::fabs(vf) * 0.36f * 0.621371f + 0.5f) : kmh;
-    std::string gear = vf < -5 ? "R" : kmh < 3 ? "N" : std::to_string(std::min(8, 1 + kmh / 40));
-    fillRect(r, SCREEN_W / 2 - 130, SCREEN_H - 100, 260, 90, {0, 0, 0, 140});
-    drawText(r, SCREEN_W / 2 + 40, SCREEN_H - 88, 8, std::to_string(shownSpeed), WHITE, 2);
-    drawText(r, SCREEN_W / 2 + 52, SCREEN_H - 60, 2.5f, set.mph ? "MPH" : "KM/H", {180, 180, 180, 255});
-    drawText(r, SCREEN_W / 2 + 52, SCREEN_H - 88, 4, gear, GOLD);
-    float tb = g.lastInput.throttle * 70, bb = g.lastInput.brake * 70;
-    fillRect(r, SCREEN_W / 2 - 120, SCREEN_H - 20 - tb, 10, tb, GREEN);
-    fillRect(r, SCREEN_W / 2 - 104, SCREEN_H - 20 - bb, 10, bb, RED);
+    float kmh = std::fabs(vf) * 0.36f;
+    int shownSpeed = int((set.mph ? kmh * 0.621371f : kmh) + 0.5f);
+    std::string gear = g.gear < 0 ? "R" : g.gear == 0 ? "N" : std::to_string(g.gear);
+    const float cx = SCREEN_W / 2, top = SCREEN_H - 124;
+    fillRect(r, cx - 130, top, 260, 114, {0, 0, 0, 140});
+
+    // 15 lights fill green, red, then blue up to the shift point; all blue flashing means shift.
+    const int LIGHTS = 15;
+    int lit = int(std::clamp((g.rpm - 8800.0f) / (SHIFT_RPM - 8800.0f), 0.0f, 1.0f) * LIGHTS);
+    bool shiftNow = lit >= LIGHTS && g.gear > 0 && g.gear < GEARS;
+    bool flashOn = (g.stepCount / 8) % 2 == 0;
+    for (int k = 0; k < LIGHTS; ++k) {
+        SDL_Color c = k < 5 ? SDL_Color{60, 220, 90, 255} : k < 10 ? SDL_Color{235, 50, 45, 255}
+                                                                   : SDL_Color{80, 120, 255, 255};
+        if (shiftNow) c = flashOn ? SDL_Color{80, 120, 255, 255} : SDL_Color{40, 40, 50, 255};
+        else if (k >= lit) c = {40, 40, 50, 255};
+        fillRect(r, cx - 119 + k * 16, top + 8, 12, 8, c);
+    }
+
+    drawText(r, cx + 40, top + 30, 8, std::to_string(shownSpeed), WHITE, 2);
+    drawText(r, cx + 40, top + 78, 2.5f, set.mph ? "MPH" : "KM/H", {180, 180, 180, 255}, 2);
+    fillRect(r, cx + 56, top + 26, 52, 52, {255, 255, 255, 20});
+    drawText(r, cx + 82, top + 32, 8, gear, GOLD, 1);
+    float tb = g.lastInput.throttle * 74, bb = g.lastInput.brake * 74;
+    fillRect(r, cx - 120, SCREEN_H - 20 - tb, 10, tb, GREEN);
+    fillRect(r, cx - 104, SCREEN_H - 20 - bb, 10, bb, RED);
 
     // Live gap to the best lap at this point on track.
     float delta;
@@ -1071,7 +1277,7 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
         drawText(r, SCREEN_W / 2, 32, 5, text, delta <= 0 ? GREEN : RED, 1);
     }
 
-    if (g.onGrass) drawText(r, SCREEN_W / 2, SCREEN_H - 130, 3, "OFF TRACK", RED, 1);
+    if (g.onGrass) drawText(r, SCREEN_W / 2, SCREEN_H - 150, 3, "OFF TRACK", RED, 1);
 
     if (g.messageTimer > 0 && !menu.open) {
         float w = textWidth(g.message, 4);
@@ -1148,7 +1354,7 @@ void updateCamera(View& view, const Game& g, const Settings& set, float frameDt,
 }
 
 int runGame() {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
@@ -1197,6 +1403,23 @@ int runGame() {
     std::vector<SDL_Vertex> verts;
     View view;
     view.cam = game.car.pos;
+
+    // Sound is optional: without an audio device the game just runs silent.
+    Synth synth;
+    SDL_AudioSpec want{}, have{};
+    want.freq = 48000;
+    want.format = AUDIO_F32SYS;
+    want.channels = 1;
+    want.samples = 512;
+    want.callback = audioCallback;
+    want.userdata = &synth;
+    SDL_AudioDeviceID audio = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (audio) {
+        synth.rate = float(have.freq);
+        SDL_PauseAudioDevice(audio, 0);
+    } else {
+        std::fprintf(stderr, "No sound: %s\n", SDL_GetError());
+    }
 
     SDL_GameController* pad = nullptr;
     Menu menu;
@@ -1340,10 +1563,19 @@ int runGame() {
         updateCamera(view, game, set, frameDt, snapCamera);
         snapCamera = false;
 
+        if (audio) {
+            // Fade out while paused or in the menu.
+            SoundParams sp = soundParams(game, paused || menu.open ? 0.0f : set.volume / 100.0f);
+            SDL_LockAudioDevice(audio);
+            synth.p = sp;
+            SDL_UnlockAudioDevice(audio);
+        }
+
         render(r, game, view, quads, mini, set, menu, paused, verts);
         SDL_RenderPresent(r);
     }
 
+    if (audio) SDL_CloseAudioDevice(audio);
     if (pad) SDL_GameControllerClose(pad);
     SDL_DestroyRenderer(r);
     SDL_DestroyWindow(window);
