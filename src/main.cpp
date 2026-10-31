@@ -272,6 +272,7 @@ struct TrackDef {
     const char* saveFile;  // best lap file, next to the executable
     std::vector<Vec2> ctrl;
     std::vector<Piece> pieces;
+    float aiLap;  // the selftest autopilot's lap; medal times are set from it
 };
 
 const TrackDef TRACKS[] = {
@@ -280,7 +281,8 @@ const TrackDef TRACKS[] = {
       {2000, 1000}, {1700, 800},  {1400, 850},  {1250, 1100}, {1400, 1400}, {1900, 1500}, {2500, 1500},
       {2900, 1700}, {2900, 2100}, {2500, 2300}, {1500, 2300}, {800, 2300},  {400, 2100},  {500, 1800},
       {300, 1500},  {-200, 1400}, {-500, 1100}, {-500, 500},  {-350, 150}},
-     {}},
+     {},
+     28.442f},
     // Fast: long straights and high-speed sweepers.
     {"COASTLINE", "best_lap_coastline.dat",
      {{0, 0},       {1000, 0},    {2000, 0},    {2850, 0},    {3080, 60},   {3180, 250},  {3250, 600},
@@ -288,14 +290,16 @@ const TrackDef TRACKS[] = {
       {3000, 2250}, {3080, 2480}, {2980, 2680}, {2750, 2780}, {2400, 2800}, {1600, 2800}, {700, 2800},
       {200, 2600},  {0, 2200},    {200, 1800},  {500, 1500},  {400, 1100},  {-100, 900},  {-500, 700},
       {-700, 300},  {-500, 0}},
-     {}},
+     {},
+     31.083f},
     // Tight street circuit: right angles and a chicane.
     {"HARBOUR", "best_lap_harbour.dat",
      {},
      {straight(1000), corner(90, 85),  straight(400),   corner(-90, 85), straight(500),   corner(90, 85),
       straight(500),  corner(90, 85),  straight(300),   corner(-40, 160), corner(80, 160), corner(-40, 160),
       straight(300),  corner(90, 85),  straight(500),   corner(-90, 85), straight(938.6f), corner(90, 85),
-      straight(400),  corner(90, 85),  straight(450)}},
+      straight(400),  corner(90, 85),  straight(450)},
+     16.325f},
 };
 constexpr int TRACK_COUNT = int(sizeof TRACKS / sizeof TRACKS[0]);
 
@@ -371,6 +375,21 @@ const SDL_Color RED{235, 70, 60, 255};
 const SDL_Color GREEN{90, 220, 110, 255};
 const SDL_Color GOLD{255, 200, 40, 255};
 const SDL_Color PURPLE{200, 110, 255, 255};
+
+// Medals for each circuit, as a share of the autopilot's lap time.
+enum Medal { MEDAL_NONE, MEDAL_BRONZE, MEDAL_SILVER, MEDAL_GOLD, MEDAL_PLATINUM };
+const char* MEDAL_NAMES[] = {"NONE", "BRONZE", "SILVER", "GOLD", "PLATINUM"};
+const SDL_Color MEDAL_COLORS[] = {
+    {150, 150, 150, 255}, {215, 135, 60, 255}, {200, 205, 215, 255}, {255, 200, 40, 255}, {120, 230, 255, 255}};
+constexpr float MEDAL_FACTOR[] = {0, 1.12f, 1.06f, 1.02f, 0.985f};
+
+float medalTime(int track, int medal) { return TRACKS[track].aiLap * MEDAL_FACTOR[medal]; }
+int medalFor(int track, float lap) {
+    int m = MEDAL_NONE;
+    for (int k = MEDAL_BRONZE; k <= MEDAL_PLATINUM; ++k)
+        if (lap > 0 && lap <= medalTime(track, k) + 1e-4f) m = k;
+    return m;
+}
 
 std::string fmtTime(float s) {
     if (s < 0) return "-:--.---";
@@ -587,9 +606,12 @@ struct Game {
             rebuildBestDist();
             e.best = true;
             save();
-            flash(prev < 0 ? "FIRST LAP RECORD SET " + fmtTime(t)
-                           : "NEW BEST LAP! " + fmtDelta(t - prev),
-                  PURPLE, 3.5f);
+            int medal = medalFor(trackId, t);
+            if (medal > medalFor(trackId, prev))
+                flash(std::string(MEDAL_NAMES[medal]) + " MEDAL! " + fmtTime(t), MEDAL_COLORS[medal], 4.0f);
+            else
+                flash(prev < 0 ? "FIRST LAP RECORD SET " + fmtTime(t) : "NEW BEST LAP! " + fmtDelta(t - prev),
+                      PURPLE, 3.5f);
         } else if (!lapValid) {
             flash("LAP " + fmtTime(t) + " NOT COUNTED", RED);
         } else {
@@ -1671,7 +1693,7 @@ void drawHud(SDL_Renderer* r, const Game& g, const Minimap& mini, const Settings
 
     // Timing panel.
     const float S = 3;
-    fillRect(r, 10, 10, 360, 244, {0, 0, 0, 140});
+    fillRect(r, 10, 10, 360, 270, {0, 0, 0, 140});
     float y = 22;
     if (replay) drawText(r, 24, y, S, "REPLAY: BEST LAP", GOLD);
     else drawText(r, 24, y, S, g.lapStarted ? "LAP " + std::to_string(g.lapNumber) : "OUT LAP", GOLD);
@@ -1688,6 +1710,13 @@ void drawHud(SDL_Renderer* r, const Game& g, const Minimap& mini, const Settings
     y += 26;
     drawText(r, 24, y, S, "IDEAL", {170, 170, 170, 255});
     drawText(r, 356, y, S, fmtTime(g.idealLap()), {170, 170, 170, 255}, 2);
+    y += 26;
+    // The medal your best lap has earned, and the time for the next one.
+    int medal = medalFor(g.trackId, g.bestTime);
+    drawText(r, 24, y, S, medal ? MEDAL_NAMES[medal] : "NO MEDAL", MEDAL_COLORS[medal]);
+    if (medal < MEDAL_PLATINUM)
+        drawText(r, 356, y, S, std::string(MEDAL_NAMES[medal + 1]) + " " + fmtTime(medalTime(g.trackId, medal + 1)),
+                 MEDAL_COLORS[medal + 1], 2);
     y += 36;
 
     // Sector times for the current lap (or the one just finished, for a few seconds).
@@ -1817,7 +1846,7 @@ struct TitleCard {
 };
 
 // The cards sit low so the demo car, in the middle of the screen, stays in view.
-constexpr float CARD_W = 300, CARD_H = 196, CARD_GAP = 30, CARD_Y = 420, CARD_MAP = 130;
+constexpr float CARD_W = 300, CARD_H = 218, CARD_GAP = 30, CARD_Y = 406, CARD_MAP = 130;
 float cardX(int i) {
     return (SCREEN_W - (TRACK_COUNT * CARD_W + (TRACK_COUNT - 1) * CARD_GAP)) / 2 + i * (CARD_W + CARD_GAP);
 }
@@ -1856,6 +1885,11 @@ void drawTitle(SDL_Renderer* r, const std::vector<TitleCard>& cards, int sel, lo
         drawText(r, x + CARD_W / 2, y + 148, 3, TRACKS[i].name, on ? GOLD : WHITE, 1);
         if (cards[i].best > 0) drawText(r, x + CARD_W / 2, y + 174, 2.5f, "BEST " + fmtTime(cards[i].best), PURPLE, 1);
         else drawText(r, x + CARD_W / 2, y + 174, 2.5f, "NO TIME YET", {150, 150, 150, 255}, 1);
+        int medal = medalFor(i, cards[i].best);
+        std::string medalText = medal == MEDAL_PLATINUM ? "PLATINUM MEDAL"
+                                : medal ? std::string(MEDAL_NAMES[medal]) + "  NEXT " + fmtTime(medalTime(i, medal + 1))
+                                        : "BRONZE AT " + fmtTime(medalTime(i, MEDAL_BRONZE));
+        drawText(r, x + CARD_W / 2, y + 196, 2.5f, medalText, MEDAL_COLORS[medal], 1);
     }
 
     fillRect(r, 0, 632, SCREEN_W, 76, {0, 0, 0, 120});
@@ -2052,6 +2086,12 @@ bool testTrack(int id) {
     std::printf("drs: %d zone(s), %.0f px; best lap %s with it, %s without\n", zones, zoneLen,
                 fmtTime(g.bestTime).c_str(), fmtTime(noDrs.bestTime).c_str());
     ok = ok && zones >= 1 && noDrs.bestTime > g.bestTime;
+
+    // Medal times hang off the autopilot's lap. If the handling changes, update aiLap.
+    float drift = std::fabs(g.bestTime - TRACKS[id].aiLap) / TRACKS[id].aiLap;
+    std::printf("medals: autopilot %s vs aiLap %s (%.2f%% off, need < 1%%), earned %s\n", fmtTime(g.bestTime).c_str(),
+                fmtTime(TRACKS[id].aiLap).c_str(), drift * 100, MEDAL_NAMES[medalFor(id, g.bestTime)]);
+    ok = ok && drift < 0.01f && medalFor(id, g.bestTime) == MEDAL_GOLD;
 
     // Save round trip, in the current format and the old v1 one (no best-ever sectors).
     for (uint32_t version : {SAVE_VERSION, 1u}) {

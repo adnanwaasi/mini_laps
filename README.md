@@ -40,6 +40,19 @@ Pick a circuit on the title screen (←/→ or click a card, then Enter), or lat
 | Coastline | Fast. Long straights and high-speed sweepers, nearly flat out on the right line |
 | Harbour | Tight street circuit: right-angle corners and a chicane |
 
+### Medals
+
+Each circuit has four medal times, set from how fast the built-in autopilot lapped it:
+
+| Medal | Target |
+|---|---|
+| Bronze | within 12% of the autopilot |
+| Silver | within 6% |
+| Gold | within 2% |
+| Platinum | 1.5% *faster* than the autopilot |
+
+Your medal and the time for the next one show in the timing panel and on the title screen cards. Earning a new medal flashes it on screen.
+
 ## Controls
 
 | Action | Keyboard | Gamepad |
