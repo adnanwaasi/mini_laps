@@ -357,6 +357,8 @@ struct LapEntry {
     bool valid, best;
 };
 
+enum Chime { CHIME_SLOWER, CHIME_FASTER, CHIME_PURPLE, CHIME_BEST_LAP };
+
 constexpr uint32_t SAVE_MAGIC = 0x4C484631;  // "1FHL"
 constexpr uint32_t SAVE_VERSION = 2;         // v2 adds the best-ever sectors; v1 still loads
 constexpr int GRID_OFFSET = 40;  // samples behind the line for the run-up
@@ -397,6 +399,8 @@ struct Game {
     bool drsOpen = false;
     int wallHits = 0;
     float lastImpact = 0;  // speed into the wall on the latest hit
+    int chimes = 0;        // timing beeps so far; the latest one is chimeKind
+    int chimeKind = 0;
     float wrongWayTime = 0;  // how long the car has been heading backwards round the lap
     bool wrongWay = false;
     int nextCp = 3, lapSteps = 0, lapNumber = 0, splitsDone = 0;
@@ -544,9 +548,24 @@ struct Game {
         ++lapNumber;
     }
 
+    // Timing beeps, like a dash display: CHIME_SLOWER, then faster than the best
+    // lap's sector, a best-ever (purple) sector, and a new best lap.
+    void chime(int kind) {
+        ++chimes;
+        chimeKind = kind;
+    }
+    int sectorChime(int k) const {
+        float st = sectorTime(splits, k);
+        if (lapValid && (bestEverSectors[k] <= 0 || st < bestEverSectors[k])) return CHIME_PURPLE;
+        if (lapValid && bestTime > 0 && st < bestSectors[k]) return CHIME_FASTER;
+        return CHIME_SLOWER;
+    }
+
     void finishLap() {
         float t = lapSteps * DT;
         splits[2] = t;
+        bool newBest = lapValid && (bestTime < 0 || t < bestTime);
+        chime(newBest ? CHIME_BEST_LAP : sectorChime(2));
         std::copy(splits, splits + 3, lastSplits);
         lastLap = t;
         LapEntry e{lapNumber, t, lapValid, false};
@@ -682,6 +701,7 @@ struct Game {
                     splits[k] = lapSteps * DT;
                     splitsDone = k + 1;
                     nextCp = k + 2;
+                    chime(sectorChime(k));
                 }
             }
         }
@@ -803,6 +823,7 @@ struct SoundParams {
     float rpm = IDLE_RPM, throttle = 0, slip = 0, speed = 0, volume = 0, impact = 0;
     bool kerb = false, grass = false;
     int wallHits = 0;
+    int chimes = 0, chimeKind = 0;
 };
 
 SoundParams soundParams(const Game& g, float volume) {
@@ -816,6 +837,8 @@ SoundParams soundParams(const Game& g, float volume) {
     p.grass = g.onGrass;
     p.wallHits = g.wallHits;
     p.impact = g.lastImpact;
+    p.chimes = g.chimes;
+    p.chimeKind = g.chimeKind;
     return p;
 }
 
@@ -827,6 +850,9 @@ struct Synth {
     float squeal = 0, squealPhase = 0, vibPhase = 0;
     float pop = 0, thump = 0, thumpTime = 0;
     int seenHits = 0;
+    int seenChimes = -1;  // -1 until the first buffer, so old beeps aren't replayed
+    float chimeNotes[4] = {}, chimeTime = 0;
+    int chimeLen = 0;
     uint32_t seed = 0x9E3779B9u;
 
     float noise() {
@@ -845,6 +871,15 @@ struct Synth {
             thumpTime = 0;
         }
         seenHits = p.wallHits;  // also resyncs after a track change resets the count
+        if (seenChimes >= 0 && p.chimes > seenChimes) {
+            static const float NOTES[][4] = {{660}, {880, 880}, {880, 1175, 1568}, {784, 988, 1175, 1568}};
+            static const int COUNT[] = {1, 2, 3, 4};
+            int kind = std::clamp(p.chimeKind, 0, 3);
+            std::copy(NOTES[kind], NOTES[kind] + 4, chimeNotes);
+            chimeLen = COUNT[kind];
+            chimeTime = 0;
+        }
+        seenChimes = p.chimes;
         float squealTarget = p.speed > 60 ? std::clamp((p.slip - 120.0f) / 350.0f, 0.0f, 1.0f) : 0.0f;
         float speedAmt = std::min(p.speed / 300.0f, 1.0f);
 
@@ -902,7 +937,17 @@ struct Synth {
                 thumpTime += dt;
             }
 
-            out[i] = std::tanh(mix * gain * 1.2f) * 0.9f;
+            // Timing beeps sit outside the soft clip so they stay clean.
+            float beep = 0;
+            if (chimeLen > 0) {
+                const float NOTE = 0.11f;
+                int note = int(chimeTime / NOTE);
+                float tn = chimeTime - note * NOTE;
+                if (note < chimeLen) beep = std::min(1.0f, tn * 300) * std::exp(-tn * 16) * std::sin(TAU * chimeNotes[note] * tn);
+                else chimeLen = 0;
+                chimeTime += dt;
+            }
+            out[i] = std::tanh(mix * gain * 1.2f) * 0.75f + beep * gain * 0.22f;
         }
     }
 };
@@ -1981,6 +2026,8 @@ bool testTrack(int id) {
     bool allValid = g.history.size() == 3;
     for (auto& e : g.history) allValid = allValid && e.valid;
     ok = ok && allValid && g.bestGhost.size() > 0;
+    std::printf("timing beeps: %d over %zu laps (need 3 a lap)\n", g.chimes, g.history.size());
+    ok = ok && g.chimes == 3 * int(g.history.size());
     std::printf("best: %s, ghost samples: %zu\n", fmtTime(g.bestTime).c_str(), g.bestGhost.size());
 
     std::printf("lap 3 live delta: max %.3f s over %d samples (need < 0.05)\n", maxDelta, deltaSamples);
@@ -2133,6 +2180,26 @@ int runSelfTest() {
     double rmsIdle = loudness(idle), rmsFlat = loudness(flat);
     std::printf("== synth rms: idle %.3f, flat out %.3f\n", rmsIdle, rmsFlat);
     ok = ok && rmsIdle > 0.01 && rmsFlat > rmsIdle;
+
+    // Each timing beep is heard over the idle once the chime count goes up.
+    for (int kind = CHIME_SLOWER; kind <= CHIME_BEST_LAP; ++kind) {
+        Synth s;
+        s.p = idle;
+        std::vector<float> buf(4800);
+        auto rms = [&]() {
+            s.fill(buf.data(), int(buf.size()));
+            double sum = 0;
+            for (float x : buf) sum += double(x) * x;
+            return std::sqrt(sum / buf.size());
+        };
+        rms();  // settle the engine
+        double before = rms();
+        s.p.chimes = 1;
+        s.p.chimeKind = kind;
+        double during = rms();
+        std::printf("== chime %d: rms %.3f over %.3f idle\n", kind, during, before);
+        ok = ok && during > before * 1.15;
+    }
 
     std::printf("%s\n", ok ? "SELFTEST PASS" : "SELFTEST FAIL");
     return ok ? 0 : 1;
@@ -2490,6 +2557,7 @@ int runGame() {
             // Fade out while paused or in the menu.
             bool quiet = paused || menu.open || (replaying && replayPaused);
             SoundParams sp = soundParams(shownGame, quiet ? 0.0f : set.volume / 100.0f * (title ? 0.5f : 1.0f));
+            if (title) sp.chimes = game.chimes;  // the demo car laps silently
             SDL_LockAudioDevice(audio);
             synth.p = sp;
             SDL_UnlockAudioDevice(audio);

@@ -105,6 +105,7 @@ The dash at the bottom shows speed, gear and throttle/brake bars. The 15 rev lig
 - **Track limits:** kerbs count as track. If the car goes fully past the kerb, the lap is marked **INVALID** and doesn't count toward your record. Grass slows you down, and tyre walls stop you.
 - Press R at any time to abandon the lap and start a fresh one from behind the line. A **WRONG WAY** warning flashes if you're heading backwards round the lap, and reversing over the line abandons the lap (cross it forwards again to start a new one).
 - Each lap is split into 3 sectors (yellow lines). The sector deltas compare against your best lap: green is faster, red is slower. A sector time turns **purple** when it's the fastest you've ever driven that sector.
+- A beep marks each sector and the line: one low beep if you were slower than your best lap there, two if faster, three rising notes for a purple sector, and a little fanfare for a new best lap.
 - Once you have a best lap, the **DELTA** box at the top shows the live gap to it at your current spot on track (green means you're ahead).
 - **IDEAL** is your theoretical best: the sum of your best-ever sectors.
 - **DRS:** each circuit has DRS zones on its longest straights, marked by a dashed line with DRS painted on the track and shown green on the minimap. Hold E (RB) in a zone to open the rear wing for less drag and more top speed. It shuts as soon as you brake or the zone ends.
