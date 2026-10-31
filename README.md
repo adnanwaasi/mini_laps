@@ -53,6 +53,7 @@ Choose the circuit at the top of the settings menu (Esc). Each one keeps its own
 | Settings menu | Esc | Back |
 | Toggle ghost | G | |
 | Toggle racing line | L | |
+| Watch your best lap | V | |
 | Pause | P | |
 | Fullscreen | F11 | |
 
@@ -78,7 +79,11 @@ Press **Esc** to open the settings menu; the game pauses while it's open. With t
 | Fullscreen, VSync | on/off | |
 | Reset best lap | | Click or press Enter twice to wipe your record and ghost |
 
-The menu also has Resume and Quit.
+The menu also has Watch best lap, Resume and Quit.
+
+### Replay
+
+Press **V** (or pick *Watch best lap* in the menu) to watch your best lap on the current circuit, with sound, gear changes and sector times. It loops until you leave. Space pauses, ←/→ jump 3 seconds, C changes the camera, L shows the racing line, and Esc, R or V go back to driving. On a gamepad: A pauses, the D-pad seeks, and B leaves.
 
 ### Camera modes
 

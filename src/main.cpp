@@ -654,6 +654,39 @@ struct Game {
         }
     }
 
+    // Replay: puts the car at sample k of a recorded lap and works out what the
+    // HUD, sound and effects need (speed, slip, steering, pedals, surface, gear).
+    void puppetTo(const std::vector<GhostSample>& ghost, int k) {
+        const int last = int(ghost.size()) - 1;
+        k = std::clamp(k, 0, last);
+        const GhostSample &s = ghost[k], &n = ghost[std::min(k + 1, last)];
+        Vec2 pos{s.x, s.y}, vel = (Vec2{n.x, n.y} - pos) * (1.0f / DT);
+        bool jumped = length(pos - car.pos) > 60;  // seeking, or looping back to the start
+        float accel = (length(vel) - length(car.vel)) / DT;
+        Vec2 fwd{std::cos(s.h), std::sin(s.h)}, right{-fwd.y, fwd.x};
+        float vf = dot(vel, fwd);
+        float yawRate = std::remainder(n.h - s.h, 2.0f * float(M_PI)) / DT;
+        float wheel = std::atan(yawRate * WHEELBASE / std::max(std::fabs(vf), 60.0f));
+        car.pos = pos;
+        car.vel = vel;
+        car.heading = s.h;
+        car.slip = dot(vel, right);
+        car.steer = std::clamp(wheel * (1.0f + std::fabs(vf) / 320.0f) / 0.62f, -1.0f, 1.0f);
+        lastInput = Input{};
+        if (!jumped) {
+            lastInput.throttle = accel > 30 ? 1.0f : 0.0f;
+            lastInput.brake = accel < -400 ? 1.0f : 0.0f;
+        }
+        TrackHit h = track.nearest(pos, idx, jumped ? -1 : 40);
+        idx = h.seg;
+        onGrass = h.dist > HALF_W + KERB_W;
+        onKerb = h.dist > HALF_W && !onGrass;
+        lapStarted = true;
+        lapSteps = k + 1;
+        ++stepCount;
+        updateGearbox(vf, lastInput.throttle);
+    }
+
     uint32_t trackSignature() const { return uint32_t(track.size()) * 100003u + uint32_t(track.length); }
 
     void writeSave(FILE* f) const {
@@ -969,6 +1002,26 @@ bool testTrack(int id) {
 int runSelfTest() {
     bool ok = true;
     for (int id = 0; id < TRACK_COUNT; ++id) ok = testTrack(id) && ok;
+
+    // Replaying a best lap drives the puppet all the way round and over the line.
+    {
+        Game g;
+        g.init(0);
+        for (long s = 0; s < 120L * 300 && g.history.empty(); ++s) g.step(autopilot(g));
+        Game rp = g;
+        int topGear = 0, grass = 0;
+        float maxSteer = 0;
+        for (int k = 0; k < int(rp.bestGhost.size()); ++k) {
+            rp.puppetTo(rp.bestGhost, k);
+            topGear = std::max(topGear, rp.gear);
+            grass += rp.onGrass;
+            maxSteer = std::max(maxSteer, std::fabs(rp.car.steer));
+        }
+        bool fine = !g.bestGhost.empty() && topGear >= 6 && grass == 0 && rp.idx < CROSS_BAND && maxSteer <= 1;
+        std::printf("== replay: top gear %d, %d steps on grass, ends at sample %d: %s\n", topGear, grass, rp.idx,
+                    fine ? "ok" : "WRONG");
+        ok = ok && fine;
+    }
 
     // Turning round just after the line: warn, then abandon the lap on crossing
     // back, without logging a junk lap.
@@ -1430,7 +1483,7 @@ struct Settings {
     int vibration = 1;
 };
 
-enum class Kind { Percent, Choice, Toggle, Units, ResetBest, Resume, Quit };
+enum class Kind { Percent, Choice, Toggle, Units, Replay, ResetBest, Resume, Quit };
 
 enum CameraMode { CAM_FOLLOW, CAM_CHASE, CAM_LOCKED, CAM_HELICOPTER, CAM_COUNT };
 const char* CAMERA_NAMES[CAM_COUNT] = {"FOLLOW", "CHASE", "LOCKED", "HELICOPTER"};
@@ -1465,6 +1518,7 @@ const MenuEntry MENU[] = {
     {"SKID MARKS", "skid_marks", &Settings::skidMarks, 0, 1, 1, Kind::Toggle},
     {"FULLSCREEN", "fullscreen", &Settings::fullscreen, 0, 1, 1, Kind::Toggle},
     {"VSYNC", "vsync", &Settings::vsync, 0, 1, 1, Kind::Toggle},
+    {"WATCH BEST LAP", nullptr, nullptr, 0, 0, 0, Kind::Replay},
     {"RESET BEST LAP", nullptr, nullptr, 0, 0, 0, Kind::ResetBest},
     {"RESUME", nullptr, nullptr, 0, 0, 0, Kind::Resume},
     {"QUIT GAME", nullptr, nullptr, 0, 0, 0, Kind::Quit},
@@ -1495,12 +1549,13 @@ struct Menu {
     bool open = false;
     int sel = 0;
     bool confirmReset = false;
+    float bestTime = -1;  // the current circuit's record, for the replay row
 };
 
 // Menu geometry, shared by drawing and mouse hit-testing.
-constexpr float MENU_X = 270, MENU_W = 740, MENU_Y = 20, MENU_ROW = 28;
+constexpr float MENU_X = 270, MENU_W = 740, MENU_Y = 14, MENU_ROW = 28;
 constexpr float MENU_VALUE_RIGHT = MENU_X + MENU_W - 30;
-float menuRowY(int i) { return MENU_Y + 70 + i * MENU_ROW; }
+float menuRowY(int i) { return MENU_Y + 64 + i * MENU_ROW; }
 
 std::string menuValue(const MenuEntry& m, const Settings& s, const Menu& menu) {
     switch (m.kind) {
@@ -1508,6 +1563,7 @@ std::string menuValue(const MenuEntry& m, const Settings& s, const Menu& menu) {
         case Kind::Choice: return std::string("< ") + m.choiceName(s.*m.field) + " >";
         case Kind::Toggle: return s.*m.field ? "ON" : "OFF";
         case Kind::Units: return s.*m.field ? "MPH" : "KM/H";
+        case Kind::Replay: return menu.bestTime > 0 ? fmtTime(menu.bestTime) : "NO LAP YET";
         case Kind::ResetBest: return menu.confirmReset ? "CLICK OR ENTER AGAIN" : "";
         default: return "";
     }
@@ -1534,7 +1590,7 @@ int menuArrowAt(const MenuEntry& m, const Settings& s, const Menu& menu, float x
 
 void drawMenu(SDL_Renderer* r, const Menu& menu, const Settings& s) {
     fillRect(r, 0, 0, SCREEN_W, SCREEN_H, {0, 0, 0, 110});
-    fillRect(r, MENU_X, MENU_Y, MENU_W, 70 + MENU_COUNT * MENU_ROW + 44, {10, 10, 16, 235});
+    fillRect(r, MENU_X, MENU_Y, MENU_W, 64 + MENU_COUNT * MENU_ROW + 44, {10, 10, 16, 235});
     drawText(r, SCREEN_W / 2, MENU_Y + 22, 5, "SETTINGS", GOLD, 1);
     for (int i = 0; i < MENU_COUNT; ++i) {
         const MenuEntry& m = MENU[i];
@@ -1553,9 +1609,9 @@ void drawMenu(SDL_Renderer* r, const Menu& menu, const Settings& s) {
 }
 
 void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<WorldQuad>& quads,
-            const Minimap& mini, const Settings& set, const Menu& menu, bool paused, const Effects& fx,
-            std::vector<SDL_Vertex>& verts) {
-    const bool showGhost = set.ghost;
+            const Minimap& mini, const Settings& set, const Menu& menu, bool paused, bool replay,
+            bool replayPaused, const Effects& fx, std::vector<SDL_Vertex>& verts) {
+    const bool showGhost = set.ghost && !replay;  // in a replay the car is the ghost
     SDL_SetRenderDrawColor(r, 40, 96, 48, 255);
     SDL_RenderClear(r);
 
@@ -1664,7 +1720,8 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
     const float S = 3;
     fillRect(r, 10, 10, 360, 244, {0, 0, 0, 140});
     float y = 22;
-    drawText(r, 24, y, S, g.lapStarted ? "LAP " + std::to_string(g.lapNumber) : "OUT LAP", GOLD);
+    if (replay) drawText(r, 24, y, S, "REPLAY: BEST LAP", GOLD);
+    else drawText(r, 24, y, S, g.lapStarted ? "LAP " + std::to_string(g.lapNumber) : "OUT LAP", GOLD);
     if (g.lapStarted && !g.lapValid) drawText(r, 356, y, S, "INVALID", RED, 2);
     y += 30;
     drawText(r, 24, y, S, "TIME", WHITE);
@@ -1749,7 +1806,13 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
 
     // Live gap to the best lap at this point on track.
     float delta;
-    if (g.liveDelta(delta)) {
+    if (replay) {
+        const char* state = replayPaused ? "REPLAY PAUSED" : "REPLAY";
+        float w = textWidth("SPACE PAUSE  LEFT/RIGHT SEEK  ESC EXIT", 2);
+        fillRect(r, SCREEN_W / 2 - w / 2 - 16, 10, w + 32, 54, {0, 0, 0, 150});
+        drawText(r, SCREEN_W / 2, 18, 4, state, (g.stepCount / 40) % 2 || replayPaused ? GOLD : WHITE, 1);
+        drawText(r, SCREEN_W / 2, 44, 2, "SPACE PAUSE  LEFT/RIGHT SEEK  ESC EXIT", {170, 170, 170, 255}, 1);
+    } else if (g.liveDelta(delta)) {
         std::string text = fmtDelta(delta);
         float w = std::max(textWidth(text, 5), textWidth("DELTA", 2));
         fillRect(r, SCREEN_W / 2 - w / 2 - 16, 10, w + 32, 54, {0, 0, 0, 150});
@@ -1774,10 +1837,13 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
         drawText(r, SCREEN_W / 2, SCREEN_H / 2 + 20, 3, "PRESS P TO RESUME", {200, 200, 200, 255}, 1);
     }
 
-    // Two short lines in the corner so they stay clear of the speedo.
-    fillRect(r, 6, SCREEN_H - 48, 378, 42, {0, 0, 0, 110});
-    drawText(r, 14, SCREEN_H - 40, 2, "WASD/ARROWS DRIVE  SPACE HANDBRAKE  R RESTART", {220, 220, 220, 200});
-    drawText(r, 14, SCREEN_H - 22, 2, "C CAMERA  G GHOST  L LINE  P PAUSE  ESC MENU", {220, 220, 220, 200});
+    // Two short lines in the corner so they stay clear of the speedo (the
+    // replay banner has its own).
+    if (!replay) {
+        fillRect(r, 6, SCREEN_H - 48, 450, 42, {0, 0, 0, 110});
+        drawText(r, 14, SCREEN_H - 40, 2, "WASD/ARROWS DRIVE  SPACE HANDBRAKE  R RESTART  P PAUSE", {220, 220, 220, 200});
+        drawText(r, 14, SCREEN_H - 22, 2, "C CAMERA  G GHOST  L LINE  V REPLAY  ESC MENU", {220, 220, 220, 200});
+    }
     if (menu.open) drawMenu(r, menu, set);
 }
 
@@ -1952,6 +2018,43 @@ int runGame() {
     Rumble rumble;
     bool running = true, paused = false;
 
+    // Best-lap replay: a copy of the game whose car is driven from the ghost.
+    Game replay;
+    bool replaying = false, replayPaused = false;
+    int replayStep = 0;
+    double replayAcc = 0;
+    auto startReplay = [&]() {
+        if (game.bestGhost.empty()) {
+            game.flash("NO BEST LAP TO WATCH YET", WHITE);
+            return;
+        }
+        replay = game;
+        replay.messageTimer = 0;
+        replay.wrongWay = false;
+        float t = 0;
+        for (int k = 0; k < 3; ++k) replay.splits[k] = t += game.bestSectors[k];
+        // When it loops, the lap just shown is the best lap again.
+        std::copy(replay.splits, replay.splits + 3, replay.lastSplits);
+        replay.lastLap = game.bestTime;
+        replay.lapValid = true;
+        replayStep = 0;
+        replayAcc = 0;
+        replay.puppetTo(replay.bestGhost, 0);
+        replaying = true;
+        replayPaused = paused = menu.open = false;
+        snapCamera = true;
+        fx = Effects{};
+    };
+    auto stopReplay = [&]() {
+        replaying = false;
+        snapCamera = true;
+        fx = Effects{};
+    };
+    auto seekReplay = [&](float secs) {
+        replayStep = std::clamp(replayStep + int(secs / DT), 0, int(replay.bestGhost.size()) - 1);
+        replay.puppetTo(replay.bestGhost, replayStep);
+    };
+
     auto menuMove = [&](int dir) {
         menu.sel = (menu.sel + dir + MENU_COUNT) % MENU_COUNT;
         menu.confirmReset = false;
@@ -1983,6 +2086,7 @@ int runGame() {
                     game.flash("BEST LAP RESET", WHITE);
                 }
                 break;
+            case Kind::Replay: startReplay(); break;
             case Kind::Resume: menu.open = false; break;
             case Kind::Quit: running = false; break;
             default: break;
@@ -2021,9 +2125,22 @@ int runGame() {
                     case SDL_SCANCODE_RETURN: case SDL_SCANCODE_SPACE: if (!e.key.repeat) menuActivate(); break;
                     default: break;
                 }
+            } else if (e.type == SDL_KEYDOWN && replaying) {
+                switch (e.key.keysym.scancode) {
+                    case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_R: case SDL_SCANCODE_RETURN: case SDL_SCANCODE_V:
+                        if (!e.key.repeat) stopReplay();
+                        break;
+                    case SDL_SCANCODE_SPACE: case SDL_SCANCODE_P: if (!e.key.repeat) replayPaused = !replayPaused; break;
+                    case SDL_SCANCODE_LEFT: case SDL_SCANCODE_A: seekReplay(-3); break;
+                    case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: seekReplay(3); break;
+                    case SDL_SCANCODE_C: if (!e.key.repeat) cycleCamera(); break;
+                    case SDL_SCANCODE_L: if (!e.key.repeat) { set.racingLine = !set.racingLine; changed(); } break;
+                    default: break;
+                }
             } else if (e.type == SDL_KEYDOWN && !e.key.repeat) {
                 switch (e.key.keysym.scancode) {
                     case SDL_SCANCODE_ESCAPE: toggleMenu(); break;
+                    case SDL_SCANCODE_V: startReplay(); break;
                     case SDL_SCANCODE_R:
                     case SDL_SCANCODE_RETURN: restartLap(); break;
                     case SDL_SCANCODE_C: cycleCamera(); break;
@@ -2061,8 +2178,14 @@ int runGame() {
             }
             if (e.type == SDL_CONTROLLERBUTTONDOWN) {
                 Uint8 b = e.cbutton.button;
-                if (b == SDL_CONTROLLER_BUTTON_BACK) toggleMenu();
-                else if (menu.open) {
+                if (b == SDL_CONTROLLER_BUTTON_BACK && !replaying) toggleMenu();
+                else if (replaying) {
+                    if (b == SDL_CONTROLLER_BUTTON_A) replayPaused = !replayPaused;
+                    if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT) seekReplay(-3);
+                    if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) seekReplay(3);
+                    if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_START || b == SDL_CONTROLLER_BUTTON_BACK)
+                        stopReplay();
+                } else if (menu.open) {
                     if (b == SDL_CONTROLLER_BUTTON_DPAD_UP) menuMove(-1);
                     if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) menuMove(1);
                     if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT) menuAdjust(-1);
@@ -2080,34 +2203,47 @@ int runGame() {
         float frameDt = float(std::min(0.25, double(now - prev) / SDL_GetPerformanceFrequency()));
         acc += frameDt;
         prev = now;
-        if (paused || menu.open) acc = 0;
+        if (paused || menu.open || replaying) acc = 0;
         Input in = readInput(pad, set);
         while (acc >= DT) {
             game.step(in);
             acc -= DT;
         }
+        // The replay loops at the end of the lap.
+        if (replaying && !replayPaused && !paused && !menu.open) replayAcc += frameDt;
+        for (; replayAcc >= DT; replayAcc -= DT) {
+            replayStep = (replayStep + 1) % int(replay.bestGhost.size());
+            replay.puppetTo(replay.bestGhost, replayStep);
+        }
+        if (replaying) {
+            float t = replay.lapSteps * DT;
+            replay.splitsDone = int(t >= replay.splits[0]) + int(t >= replay.splits[1]) + int(t >= replay.splits[2]);
+        }
+        const Game& shownGame = replaying ? replay : game;
+        menu.bestTime = game.bestTime;
 
-        updateCamera(view, game, set, frameDt, snapCamera);
+        updateCamera(view, shownGame, set, frameDt, snapCamera);
         snapCamera = false;
 
         if (audio) {
             // Fade out while paused or in the menu.
-            SoundParams sp = soundParams(game, paused || menu.open ? 0.0f : set.volume / 100.0f);
+            bool quiet = paused || menu.open || (replaying && replayPaused);
+            SoundParams sp = soundParams(shownGame, quiet ? 0.0f : set.volume / 100.0f);
             SDL_LockAudioDevice(audio);
             synth.p = sp;
             SDL_UnlockAudioDevice(audio);
         }
 
-        fx.update(game, paused || menu.open ? 0.0f : frameDt);
+        fx.update(shownGame, paused || menu.open || (replaying && replayPaused) ? 0.0f : frameDt);
         View shown = view;
         if (fx.shake > 0.3f)
             shown.cam = view.cam + Vec2{fx.rng.range(-1, 1), fx.rng.range(-1, 1)} * (fx.shake / view.zoom);
 
-        rumble.update(pad, game, fx, set.vibration && !paused && !menu.open);
+        rumble.update(pad, shownGame, fx, set.vibration && !paused && !menu.open && !replaying);
         // The mouse is only for the menu.
         if (bool(SDL_ShowCursor(SDL_QUERY)) != menu.open) SDL_ShowCursor(menu.open ? SDL_ENABLE : SDL_DISABLE);
 
-        render(r, game, shown, quads, mini, set, menu, paused, fx, verts);
+        render(r, shownGame, shown, quads, mini, set, menu, paused, replaying, replayPaused, fx, verts);
         SDL_RenderPresent(r);
     }
 
