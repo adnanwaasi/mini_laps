@@ -354,6 +354,8 @@ struct Game {
     float rpm = IDLE_RPM;
     int wallHits = 0;
     float lastImpact = 0;  // speed into the wall on the latest hit
+    float wrongWayTime = 0;  // how long the car has been heading backwards round the lap
+    bool wrongWay = false;
     int nextCp = 3, lapSteps = 0, lapNumber = 0, splitsDone = 0;
     float splits[3] = {}, lastSplits[3] = {};
     float bestTime = -1, bestSectors[3] = {}, lastLap = -1;
@@ -414,6 +416,8 @@ struct Game {
 
     void placeAt(int i) {
         car = Car{};
+        wrongWayTime = 0;
+        wrongWay = false;
         gear = 0;
         rpm = IDLE_RPM;
         car.pos = track.pts[i];
@@ -612,6 +616,8 @@ struct Game {
         idx = after.seg;
         lapDist = track.distanceAt(after, lapDist);
         offTrack = after.dist > HALF_W + KERB_W + LIMIT_TOL;
+        wrongWayTime = dot(car.vel, track.tangent(idx)) < -40 ? wrongWayTime + DT : 0;
+        wrongWay = wrongWayTime > 0.5f;
         bool crossedFwd = prevIdx >= N - CROSS_BAND && idx < CROSS_BAND;
         bool crossedBack = prevIdx < CROSS_BAND && idx >= N - CROSS_BAND;
 
@@ -638,10 +644,13 @@ struct Game {
                 finishLap();
             }
         }
+        // Reversing over the line abandons the lap; crossing it forwards again starts a fresh one.
         if (crossedBack && lapStarted) {
-            lapValid = false;
-            nextCp = 3;
-            flash("WRONG WAY", RED);
+            lapStarted = false;
+            lapValid = true;
+            splitsDone = 0;
+            curGhost.clear();
+            flash("LAP ABANDONED", RED);
         }
     }
 
@@ -960,6 +969,27 @@ bool testTrack(int id) {
 int runSelfTest() {
     bool ok = true;
     for (int id = 0; id < TRACK_COUNT; ++id) ok = testTrack(id) && ok;
+
+    // Turning round just after the line: warn, then abandon the lap on crossing
+    // back, without logging a junk lap.
+    {
+        Game g;
+        g.init(0);
+        g.placeAt(30);
+        g.startLap();
+        g.car.heading += float(M_PI);
+        Input in;
+        in.throttle = 1;
+        bool warned = false;
+        for (int s = 0; s < 240 && g.lapStarted; ++s) {
+            g.step(in);
+            warned = warned || g.wrongWay;
+        }
+        bool abandoned = !g.lapStarted && g.history.empty();
+        std::printf("== reversing over the line: warned %s, abandoned %s\n", warned ? "yes" : "NO",
+                    abandoned ? "yes" : "NO");
+        ok = ok && warned && abandoned;
+    }
 
     // The synth must stay finite and inside [-1, 1], and get louder on throttle.
     auto loudness = [](SoundParams p) {
@@ -1397,6 +1427,7 @@ struct Settings {
     int volume = 70;
     int track = 0;
     int racingLine = 0;
+    int vibration = 1;
 };
 
 enum class Kind { Percent, Choice, Toggle, Units, ResetBest, Resume, Quit };
@@ -1421,6 +1452,7 @@ const MenuEntry MENU[] = {
     {"STEERING SENSITIVITY", "steer_sensitivity", &Settings::steerSensitivity, 50, 150, 5, Kind::Percent},
     {"STEERING SPEED", "steer_speed", &Settings::steerSpeed, 50, 200, 10, Kind::Percent},
     {"GAMEPAD DEADZONE", "pad_deadzone", &Settings::padDeadzone, 0, 30, 2, Kind::Percent},
+    {"GAMEPAD VIBRATION", "vibration", &Settings::vibration, 0, 1, 1, Kind::Toggle},
     {"CAMERA MODE", "camera_mode", &Settings::cameraMode, 0, CAM_COUNT - 1, 1, Kind::Choice, cameraName},
     {"CAMERA ZOOM", "camera_zoom", &Settings::cameraZoom, 60, 150, 5, Kind::Percent},
     {"CAMERA LOOK-AHEAD", "look_ahead", &Settings::lookAhead, 0, 150, 10, Kind::Percent},
@@ -1466,7 +1498,7 @@ struct Menu {
 };
 
 // Menu geometry, shared by drawing and mouse hit-testing.
-constexpr float MENU_X = 270, MENU_W = 740, MENU_Y = 24, MENU_ROW = 30;
+constexpr float MENU_X = 270, MENU_W = 740, MENU_Y = 20, MENU_ROW = 28;
 constexpr float MENU_VALUE_RIGHT = MENU_X + MENU_W - 30;
 float menuRowY(int i) { return MENU_Y + 70 + i * MENU_ROW; }
 
@@ -1726,6 +1758,10 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
     }
 
     if (g.onGrass) drawText(r, SCREEN_W / 2, SCREEN_H - 150, 3, "OFF TRACK", RED, 1);
+    if (g.wrongWay && (g.stepCount / 30) % 2 == 0) {
+        fillRect(r, SCREEN_W / 2 - 190, SCREEN_H / 2 - 150, 380, 64, {120, 0, 0, 180});
+        drawText(r, SCREEN_W / 2, SCREEN_H / 2 - 138, 8, "WRONG WAY", WHITE, 1);
+    }
 
     if (g.messageTimer > 0 && !menu.open) {
         float w = textWidth(g.message, 4);
@@ -1744,6 +1780,35 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
     drawText(r, 14, SCREEN_H - 22, 2, "C CAMERA  G GHOST  L LINE  P PAUSE  ESC MENU", {220, 220, 220, 200});
     if (menu.open) drawMenu(r, menu, set);
 }
+
+// Gamepad rumble from what the tyres are doing. Only sent when it changes, or
+// to keep it going, since some controllers are slow to take updates.
+struct Rumble {
+    float low = 0, high = 0;
+    Uint32 sentAt = 0;
+
+    void update(SDL_GameController* pad, const Game& g, const Effects& fx, bool active) {
+        if (!pad) return;
+        float speed = std::min(length(g.car.vel) / 400.0f, 1.0f), l = 0, h = 0;
+        if (active) {
+            if (g.onKerb) {
+                l = 0.35f * speed;
+                h = 0.3f * speed;
+            }
+            if (g.onGrass) l = std::max(l, 0.5f * speed);
+            h = std::max(h, std::clamp((std::fabs(g.car.slip) - 150.0f) / 400.0f, 0.0f, 0.5f));
+            l = std::max(l, std::min(fx.shake / 10.0f, 1.0f));  // wall hits
+        }
+        Uint32 now = SDL_GetTicks();
+        bool changed = std::fabs(l - low) > 0.03f || std::fabs(h - high) > 0.03f;
+        bool refresh = (l > 0 || h > 0) && now - sentAt > 80;
+        if (!changed && !refresh) return;
+        low = l;
+        high = h;
+        sentAt = now;
+        SDL_GameControllerRumble(pad, Uint16(l * 65535), Uint16(h * 65535), 150);
+    }
+};
 
 Input readInput(SDL_GameController* pad, const Settings& set) {
     const Uint8* k = SDL_GetKeyboardState(nullptr);
@@ -1884,6 +1949,7 @@ int runGame() {
 
     SDL_GameController* pad = nullptr;
     Menu menu;
+    Rumble rumble;
     bool running = true, paused = false;
 
     auto menuMove = [&](int dir) {
@@ -2036,6 +2102,10 @@ int runGame() {
         View shown = view;
         if (fx.shake > 0.3f)
             shown.cam = view.cam + Vec2{fx.rng.range(-1, 1), fx.rng.range(-1, 1)} * (fx.shake / view.zoom);
+
+        rumble.update(pad, game, fx, set.vibration && !paused && !menu.open);
+        // The mouse is only for the menu.
+        if (bool(SDL_ShowCursor(SDL_QUERY)) != menu.open) SDL_ShowCursor(menu.open ? SDL_ENABLE : SDL_DISABLE);
 
         render(r, game, shown, quads, mini, set, menu, paused, fx, verts);
         SDL_RenderPresent(r);

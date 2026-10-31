@@ -66,6 +66,7 @@ Press **Esc** to open the settings menu; the game pauses while it's open. With t
 | Steering sensitivity | 50–150% | How far the wheels turn at full lock. Lower is calmer, higher is twitchier |
 | Steering speed | 50–200% | How fast the wheel moves when you press or release a key |
 | Gamepad deadzone | 0–30% | How much stick movement is ignored around the centre |
+| Gamepad vibration | on/off | Rumble on kerbs, grass, slides and wall hits |
 | Camera mode | Follow / Chase / Locked / Helicopter | See below (also cycles with C) |
 | Camera zoom | 60–150% | Lower shows more of the track |
 | Camera look-ahead | 0–150% | How far the camera leads the car in the direction you're going |
@@ -96,7 +97,7 @@ The dash at the bottom shows speed, gear and throttle/brake bars. The 15 rev lig
 
 - You start on an out lap. Timing begins when you cross the chequered line.
 - **Track limits:** kerbs count as track. If the car goes fully past the kerb, the lap is marked **INVALID** and doesn't count toward your record. Grass slows you down, and tyre walls stop you.
-- Press R at any time to abandon the lap and start a fresh one from behind the line. Driving backwards over the line invalidates the lap.
+- Press R at any time to abandon the lap and start a fresh one from behind the line. A **WRONG WAY** warning flashes if you're heading backwards round the lap, and reversing over the line abandons the lap (cross it forwards again to start a new one).
 - Each lap is split into 3 sectors (yellow lines). The sector deltas compare against your best lap: green is faster, red is slower. A sector time turns **purple** when it's the fastest you've ever driven that sector.
 - Once you have a best lap, the **DELTA** box at the top shows the live gap to it at your current spot on track (green means you're ahead).
 - **IDEAL** is your theoretical best: the sum of your best-ever sectors.
