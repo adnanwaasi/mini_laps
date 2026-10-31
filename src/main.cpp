@@ -128,6 +128,83 @@ struct Track {
         return best;
     }
 
+    // Racing line: a minimum-curvature path inside the track edges, with the
+    // fastest speed the car can carry at each sample. zone: 0 = accelerating
+    // or flat out, 1 = at the grip limit through a corner, 2 = braking.
+    std::vector<Vec2> line;
+    std::vector<float> lineSpeed;
+    std::vector<uint8_t> lineZone;
+
+    void buildRacingLine(float maxLat, float engine, float brake, float topSpeed) {
+        const int N = size();
+        const float lim = HALF_W - 10;
+        auto at = [N](int i) { return ((i % N) + N) % N; };
+        line.assign(pts.begin(), pts.end());
+        // Minimum curvature swings the line out-in-out through the corners. Each
+        // point slides across the asphalt to reduce the squared turning per unit
+        // length (the integral of curvature squared) around it, using neighbours
+        // k samples away, coarse to fine.
+        auto bend = [&](int j, int k) {
+            Vec2 a = line[at(j - k)], b = line[at(j)], c = line[at(j + k)];
+            Vec2 u = b - a, v = c - b;
+            float lu = ::length(u), lv = ::length(v);
+            if (lu < 1e-3f || lv < 1e-3f) return 0.0f;
+            float turn = ::length(v * (1 / lv) - u * (1 / lu));  // ~ turning angle
+            return turn * turn / (lu + lv);
+        };
+        std::vector<float> off(N, 0.0f);
+        for (int k : {32, 16, 8, 4, 2, 1}) {
+            float step = std::min(8.0f, 1.0f + 0.5f * k);
+            for (int iter = 0; iter < 40; ++iter, step *= 0.92f)
+                for (int i = 0; i < N; ++i) {
+                    float bestOff = off[i];
+                    float best = bend(i - k, k) + bend(i, k) + bend(i + k, k);
+                    for (float d : {-step, step}) {
+                        float o = std::clamp(off[i] + d, -lim, lim);
+                        line[i] = pts[i] + normals[i] * o;
+                        float cost = bend(i - k, k) + bend(i, k) + bend(i + k, k);
+                        if (cost < best) {
+                            best = cost;
+                            bestOff = o;
+                        }
+                    }
+                    off[i] = bestOff;
+                    line[i] = pts[i] + normals[i] * bestOff;
+                }
+        }
+
+        // Speed: the grip limit from the line's curvature, then forward
+        // (acceleration) and backward (braking) passes, twice round the loop.
+        std::vector<float> ds(N), vmax(N);
+        for (int i = 0; i < N; ++i) {
+            ds[i] = ::length(line[at(i + 1)] - line[i]);
+            float k = 0;
+            for (int j = -3; j <= 3; ++j) {
+                int m = at(i + j);
+                Vec2 u = line[m] - line[at(m - 1)], v = line[at(m + 1)] - line[m];
+                k += std::fabs(std::atan2(cross(u, v), dot(u, v))) / std::max(0.5f * (::length(u) + ::length(v)), 1e-3f);
+            }
+            k /= 7;
+            vmax[i] = k > 1e-6f ? std::min(topSpeed, std::sqrt(maxLat / k)) : topSpeed;
+        }
+        lineSpeed = vmax;
+        for (int pass = 0; pass < 2 * N; ++pass) {
+            int i = pass % N, j = (i + 1) % N;
+            float v = lineSpeed[i], acc = engine * (1.0f - v / topSpeed);
+            lineSpeed[j] = std::min(lineSpeed[j], std::sqrt(v * v + 2 * std::max(acc, 0.0f) * ds[i]));
+        }
+        for (int pass = 2 * N - 1; pass >= 0; --pass) {
+            int i = pass % N, j = (i + 1) % N;
+            lineSpeed[i] = std::min(lineSpeed[i], std::sqrt(lineSpeed[j] * lineSpeed[j] + 2 * brake * ds[i]));
+        }
+        lineZone.assign(N, 0);
+        for (int i = 0; i < N; ++i) {
+            float v = lineSpeed[i], vn = lineSpeed[(i + 1) % N];
+            if (vn < v - 0.5f) lineZone[i] = 2;
+            else if (v < topSpeed - 1 && v >= vmax[i] - 1) lineZone[i] = 1;
+        }
+    }
+
     // Distance along the lap at a hit, unwrapped so it stays continuous with
     // prev (just past the line reads as length + a bit, not ~0).
     float distanceAt(const TrackHit& h, float prev) const {
@@ -162,7 +239,7 @@ const TrackDef TRACKS[] = {
       {2900, 1700}, {2900, 2100}, {2500, 2300}, {1500, 2300}, {800, 2300},  {400, 2100},  {500, 1800},
       {300, 1500},  {-200, 1400}, {-500, 1100}, {-500, 500},  {-350, 150}},
      {}},
-    // Fast: long straights, two big stops and quick esses.
+    // Fast: long straights and high-speed sweepers.
     {"COASTLINE", "best_lap_coastline.dat",
      {{0, 0},       {1000, 0},    {2000, 0},    {2850, 0},    {3080, 60},   {3180, 250},  {3250, 600},
       {3300, 1000}, {2900, 1200}, {2500, 1100}, {2100, 1250}, {1900, 1600}, {2100, 1950}, {2700, 2050},
@@ -301,6 +378,8 @@ struct Game {
     void init(int trackIndex = 0) {
         trackId = trackIndex;
         track.build(circuitLayout(trackIndex));
+        // A little under the real limits, so the line is drivable rather than perfect.
+        track.buildRacingLine(MAX_LAT * 0.85f, ENGINE, BRAKE * 0.8f, TOP_SPEED);
         cpIdx[0] = track.size() / 3;
         cpIdx[1] = 2 * track.size() / 3;
         load();
@@ -741,27 +820,23 @@ void audioCallback(void* userdata, Uint8* stream, int len) {
 }
 
 // Simple pure-pursuit driver used by --selftest to check the game is lappable.
+// It follows the racing line at the line's own speeds.
 Input autopilot(const Game& g) {
     const Track& t = g.track;
     const int N = t.size();
     float speed = length(g.car.vel);
-    Vec2 target = t.pts[(g.idx + 6 + int(speed * 0.02f)) % N];
+    Vec2 target = t.line[(g.idx + 6 + int(speed * 0.02f)) % N];
     Vec2 d = target - g.car.pos;
     float diff = std::remainder(std::atan2(d.y, d.x) - g.car.heading, 2.0f * float(M_PI));
 
-    float limit = 1e9f, dist = 0;
-    for (int k = 0; k < 160; ++k) {
-        int j = (g.idx + k) % N;
-        dist += length(t.pts[(j + 1) % N] - t.pts[j]);
-        float vmax = t.curvature[j] > 1e-5f ? std::sqrt(MAX_LAT * 0.7f / t.curvature[j]) : 1e9f;
-        limit = std::min(limit, std::sqrt(vmax * vmax + 2.0f * BRAKE * 0.6f * dist));
-    }
+    float limit = 1e9f;
+    for (int k = 0; k < 5; ++k) limit = std::min(limit, t.lineSpeed[(g.idx + k) % N]);
     Vec2 fwd{std::cos(g.car.heading), std::sin(g.car.heading)};
     float vf = dot(g.car.vel, fwd);
     Input in;
     in.steer = std::clamp(diff * 3.0f, -1.0f, 1.0f);
-    in.throttle = vf < limit ? 1.0f : 0.0f;
-    in.brake = vf > limit + 15.0f ? 1.0f : 0.0f;
+    in.throttle = std::clamp((limit - vf) / 20.0f, 0.0f, 1.0f);
+    in.brake = std::clamp((vf - limit - 5.0f) / 20.0f, 0.0f, 1.0f);
     return in;
 }
 
@@ -788,6 +863,24 @@ bool testTrack(int id) {
     const float minRadius = HALF_W + KERB_W + 25;
     std::printf("tightest corner: %.0f px radius (need > %.0f)\n", 1 / maxCurv, minRadius);
     ok = ok && 1 / maxCurv > minRadius;
+
+    // The racing line should open the corners up well beyond the centre line,
+    // and stay on the asphalt. Curvature is averaged over 9 samples, as for the centre line.
+    std::vector<float> raw(N);
+    float lineCurv = 0, lineOff = 0;
+    for (int i = 0; i < N; ++i) {
+        Vec2 u = t.line[i] - t.line[(i - 1 + N) % N], v = t.line[(i + 1) % N] - t.line[i];
+        raw[i] = std::fabs(std::atan2(cross(u, v), dot(u, v))) / (0.5f * (length(u) + length(v)));
+        lineOff = std::max(lineOff, std::fabs(dot(t.line[i] - t.pts[i], t.normals[i])));
+    }
+    for (int i = 0; i < N; ++i) {
+        float k = 0;
+        for (int j = -4; j <= 4; ++j) k += raw[((i + j) % N + N) % N];
+        lineCurv = std::max(lineCurv, k / 9);
+    }
+    std::printf("racing line: tightest %.0f px radius (need > 1.3x centre), widest %.0f px off centre (need < %.0f)\n",
+                1 / lineCurv, lineOff, HALF_W);
+    ok = ok && 1 / lineCurv > 1.3f / maxCurv && lineOff < HALF_W;
 
     // Laps 2 and 3 are driven identically, so the live delta on lap 3 should hover near zero.
     float maxDelta = 0;
@@ -821,7 +914,7 @@ bool testTrack(int id) {
     ok = ok && ideal > 0 && ideal <= g.bestTime + 1e-4f;
 
     std::printf("gearbox: top gear %d, %d shifts, rpm %.0f-%.0f\n", topGear, shifts, rpmLo, rpmHi);
-    ok = ok && topGear >= 5 && shifts >= 20 && rpmLo >= IDLE_RPM - 1 && rpmHi <= MAX_RPM + 1;
+    ok = ok && topGear >= 5 && shifts >= topGear && rpmLo >= IDLE_RPM - 1 && rpmHi <= MAX_RPM + 1;
 
     // Save round trip, in the current format and the old v1 one (no best-ever sectors).
     for (uint32_t version : {SAVE_VERSION, 1u}) {
@@ -1211,9 +1304,11 @@ std::vector<WorldQuad> buildTrackQuads(const Game& g) {
         }
 
     // Staggered grid slots behind the line; the player starts in the second one.
+    // Slots that would land in a corner are left off.
     const SDL_Color paint{235, 235, 235, 200};
     for (int k = 1; k <= 4; ++k) {
         int i = N - k * GRID_OFFSET / 2;
+        if (t.curvature[i] > 0.0008f) continue;
         float o = (k % 2 ? -GRID_SLOT : GRID_SLOT);
         across(i, 27, 30, o - 22, o + 22, paint);
         across(i, -26, 30, o - 22, o - 19, paint);
@@ -1301,6 +1396,7 @@ struct Settings {
     int speedZoom = 1, mph = 0, ghost = 1, minimap = 1, skidMarks = 1, fullscreen = 0, vsync = 1;
     int volume = 70;
     int track = 0;
+    int racingLine = 0;
 };
 
 enum class Kind { Percent, Choice, Toggle, Units, ResetBest, Resume, Quit };
@@ -1331,6 +1427,7 @@ const MenuEntry MENU[] = {
     {"ZOOM OUT WITH SPEED", "speed_zoom", &Settings::speedZoom, 0, 1, 1, Kind::Toggle},
     {"SPEED UNITS", "mph", &Settings::mph, 0, 1, 1, Kind::Units},
     {"SOUND VOLUME", "volume", &Settings::volume, 0, 100, 10, Kind::Percent},
+    {"RACING LINE", "racing_line", &Settings::racingLine, 0, 1, 1, Kind::Toggle},
     {"GHOST CAR", "ghost", &Settings::ghost, 0, 1, 1, Kind::Toggle},
     {"MINIMAP", "minimap", &Settings::minimap, 0, 1, 1, Kind::Toggle},
     {"SKID MARKS", "skid_marks", &Settings::skidMarks, 0, 1, 1, Kind::Toggle},
@@ -1371,7 +1468,7 @@ struct Menu {
 // Menu geometry, shared by drawing and mouse hit-testing.
 constexpr float MENU_X = 270, MENU_W = 740, MENU_Y = 24, MENU_ROW = 30;
 constexpr float MENU_VALUE_RIGHT = MENU_X + MENU_W - 30;
-float menuRowY(int i) { return MENU_Y + 80 + i * MENU_ROW; }
+float menuRowY(int i) { return MENU_Y + 70 + i * MENU_ROW; }
 
 std::string menuValue(const MenuEntry& m, const Settings& s, const Menu& menu) {
     switch (m.kind) {
@@ -1405,7 +1502,7 @@ int menuArrowAt(const MenuEntry& m, const Settings& s, const Menu& menu, float x
 
 void drawMenu(SDL_Renderer* r, const Menu& menu, const Settings& s) {
     fillRect(r, 0, 0, SCREEN_W, SCREEN_H, {0, 0, 0, 110});
-    fillRect(r, MENU_X, MENU_Y, MENU_W, 80 + MENU_COUNT * MENU_ROW + 44, {10, 10, 16, 235});
+    fillRect(r, MENU_X, MENU_Y, MENU_W, 70 + MENU_COUNT * MENU_ROW + 44, {10, 10, 16, 235});
     drawText(r, SCREEN_W / 2, MENU_Y + 22, 5, "SETTINGS", GOLD, 1);
     for (int i = 0; i < MENU_COUNT; ++i) {
         const MenuEntry& m = MENU[i];
@@ -1471,8 +1568,27 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
         SDL_RenderFillRectsF(r, marks.data(), int(marks.size()));
     }
 
-    // Smoke and dust: puffs that grow and fade.
+    // Racing line ahead of the car: green to accelerate, yellow at the
+    // cornering limit, red to brake. It fades out with distance.
     verts.clear();
+    if (set.racingLine) {
+        const Track& t = g.track;
+        const int N = t.size(), AHEAD = 170;
+        const float w = std::max(3.0f, 5.0f * view.zoom);
+        for (int k = -10; k < AHEAD; ++k) {
+            int i = ((g.idx + k) % N + N) % N, j = (i + 1) % N;
+            Vec2 a = view.toScreen(t.line[i]), b = view.toScreen(t.line[j]);
+            Vec2 n = normalized(b - a);
+            n = Vec2{-n.y, n.x} * w;
+            SDL_Color c = t.lineZone[i] == 2 ? SDL_Color{235, 60, 50, 255}
+                          : t.lineZone[i] == 1 ? SDL_Color{255, 200, 40, 255}
+                                               : SDL_Color{60, 220, 90, 255};
+            c.a = Uint8(210 * std::clamp(1.0f - float(k) / AHEAD, 0.0f, 1.0f));
+            pushQuad(verts, a - n, b - n, b + n, a + n, c);
+        }
+    }
+
+    // Smoke and dust: puffs that grow and fade.
     for (const Particle& p : fx.parts) {
         float t = p.age / p.life, s = p.size * (1.0f + 2.5f * t) * view.zoom;
         Vec2 c = view.toScreen(p.pos);
@@ -1625,7 +1741,7 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
     // Two short lines in the corner so they stay clear of the speedo.
     fillRect(r, 6, SCREEN_H - 48, 378, 42, {0, 0, 0, 110});
     drawText(r, 14, SCREEN_H - 40, 2, "WASD/ARROWS DRIVE  SPACE HANDBRAKE  R RESTART", {220, 220, 220, 200});
-    drawText(r, 14, SCREEN_H - 22, 2, "C CAMERA  G GHOST  P PAUSE  ESC SETTINGS", {220, 220, 220, 200});
+    drawText(r, 14, SCREEN_H - 22, 2, "C CAMERA  G GHOST  L LINE  P PAUSE  ESC MENU", {220, 220, 220, 200});
     if (menu.open) drawMenu(r, menu, set);
 }
 
@@ -1846,6 +1962,7 @@ int runGame() {
                     case SDL_SCANCODE_RETURN: restartLap(); break;
                     case SDL_SCANCODE_C: cycleCamera(); break;
                     case SDL_SCANCODE_G: set.ghost = !set.ghost; changed(); break;
+                    case SDL_SCANCODE_L: set.racingLine = !set.racingLine; changed(); break;
                     case SDL_SCANCODE_P: paused = !paused; break;
                     case SDL_SCANCODE_F11: set.fullscreen = !set.fullscreen; changed(); break;
                     default: break;

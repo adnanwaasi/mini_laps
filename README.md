@@ -37,7 +37,7 @@ Choose the circuit at the top of the settings menu (Esc). Each one keeps its own
 | Circuit | Character |
 |---|---|
 | Parkland | The original: a mix of long sweepers, a hairpin and a fast back section |
-| Coastline | Fast. Long straights, two big stops and quick esses |
+| Coastline | Fast. Long straights and high-speed sweepers, nearly flat out on the right line |
 | Harbour | Tight street circuit: right-angle corners and a chicane |
 
 ## Controls
@@ -52,6 +52,7 @@ Choose the circuit at the top of the settings menu (Esc). Each one keeps its own
 | Cycle camera mode | C | Y |
 | Settings menu | Esc | Back |
 | Toggle ghost | G | |
+| Toggle racing line | L | |
 | Pause | P | |
 | Fullscreen | F11 | |
 
@@ -71,6 +72,7 @@ Press **Esc** to open the settings menu; the game pauses while it's open. With t
 | Zoom out with speed | on/off | Pulls the camera back at high speed |
 | Speed units | km/h / mph | |
 | Sound volume | 0–100% | 0 turns the sound off |
+| Racing line | on/off | Shows the fastest line ahead (also L). Green: accelerate, yellow: at the grip limit, red: brake |
 | Ghost car, minimap, skid marks | on/off | |
 | Fullscreen, VSync | on/off | |
 | Reset best lap | | Click or press Enter twice to wipe your record and ghost |
