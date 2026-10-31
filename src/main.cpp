@@ -1608,10 +1608,9 @@ void drawMenu(SDL_Renderer* r, const Menu& menu, const Settings& s) {
              {170, 170, 170, 255}, 1);
 }
 
-void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<WorldQuad>& quads,
-            const Minimap& mini, const Settings& set, const Menu& menu, bool paused, bool replay,
-            bool replayPaused, const Effects& fx, std::vector<SDL_Vertex>& verts) {
-    const bool showGhost = set.ghost && !replay;  // in a replay the car is the ghost
+// The world: ground, track, scenery, skid marks, racing line, smoke and cars.
+void drawWorld(SDL_Renderer* r, const Game& g, const View& view, const std::vector<WorldQuad>& quads,
+               const Settings& set, bool showGhost, const Effects& fx, std::vector<SDL_Vertex>& verts) {
     SDL_SetRenderDrawColor(r, 40, 96, 48, 255);
     SDL_RenderClear(r);
 
@@ -1694,6 +1693,12 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
     pushCarShadow(verts, view, g.car.pos, g.car.heading);
     pushCar(verts, view, g.car.pos, g.car.heading, g.car.steer, {220, 30, 40, 255}, 255);
     SDL_RenderGeometry(r, nullptr, verts.data(), int(verts.size()), nullptr, 0);
+}
+
+// Everything over the world: minimap, timing, dash, banners and hints.
+void drawHud(SDL_Renderer* r, const Game& g, const Minimap& mini, const Settings& set, const Menu& menu,
+             bool paused, bool replay, bool replayPaused) {
+    bool ghostVisible = set.ghost && !replay && g.lapStarted && g.lapSteps < int(g.bestGhost.size());
 
     // Minimap.
     if (set.minimap) {
@@ -1844,6 +1849,66 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
         drawText(r, 14, SCREEN_H - 40, 2, "WASD/ARROWS DRIVE  SPACE HANDBRAKE  R RESTART  P PAUSE", {220, 220, 220, 200});
         drawText(r, 14, SCREEN_H - 22, 2, "C CAMERA  G GHOST  L LINE  V REPLAY  ESC MENU", {220, 220, 220, 200});
     }
+}
+
+// Title screen: pick a circuit while a demo car laps it behind the cards.
+struct TitleCard {
+    Minimap outline;
+    float best = -1;
+};
+
+// The cards sit low so the demo car, in the middle of the screen, stays in view.
+constexpr float CARD_W = 300, CARD_H = 196, CARD_GAP = 30, CARD_Y = 420, CARD_MAP = 130;
+float cardX(int i) {
+    return (SCREEN_W - (TRACK_COUNT * CARD_W + (TRACK_COUNT - 1) * CARD_GAP)) / 2 + i * (CARD_W + CARD_GAP);
+}
+int cardAt(float x, float y) {
+    for (int i = 0; i < TRACK_COUNT; ++i)
+        if (x >= cardX(i) && x < cardX(i) + CARD_W && y >= CARD_Y && y < CARD_Y + CARD_H) return i;
+    return -1;
+}
+
+void drawTitle(SDL_Renderer* r, const std::vector<TitleCard>& cards, int sel, long tick) {
+    fillRect(r, 0, 0, SCREEN_W, SCREEN_H, {0, 0, 0, 70});
+    fillRect(r, 0, 36, SCREEN_W, 172, {0, 0, 0, 190});
+    drawText(r, SCREEN_W / 2, 56, 16, "F1 HOTLAP", WHITE, 1);
+    fillRect(r, SCREEN_W / 2 - 300, 150, 600, 6, RED);
+    drawText(r, SCREEN_W / 2, 172, 3, "TOP-DOWN TIME TRIAL", GOLD, 1);
+
+    for (int i = 0; i < TRACK_COUNT; ++i) {
+        float x = cardX(i), y = CARD_Y;
+        bool on = i == sel;
+        fillRect(r, x, y, CARD_W, CARD_H, on ? SDL_Color{22, 22, 30, 235} : SDL_Color{0, 0, 0, 170});
+        if (on) {
+            fillRect(r, x, y, CARD_W, 4, GOLD);
+            fillRect(r, x, y + CARD_H - 4, CARD_W, 4, GOLD);
+            fillRect(r, x, y, 4, CARD_H, GOLD);
+            fillRect(r, x + CARD_W - 4, y, 4, CARD_H, GOLD);
+        }
+        std::vector<SDL_FPoint> line = cards[i].outline.line;
+        Uint8 shade = on ? 240 : 150;
+        SDL_SetRenderDrawColor(r, shade, shade, shade, 255);
+        for (int d = 0; d < 2; ++d) {
+            SDL_RenderDrawLinesF(r, line.data(), int(line.size()));
+            for (auto& p : line) p.x += 1;
+        }
+        SDL_FPoint start = cards[i].outline.line.front();
+        fillRect(r, start.x - 3, start.y - 3, 7, 7, RED);
+        drawText(r, x + CARD_W / 2, y + 148, 3, TRACKS[i].name, on ? GOLD : WHITE, 1);
+        if (cards[i].best > 0) drawText(r, x + CARD_W / 2, y + 174, 2.5f, "BEST " + fmtTime(cards[i].best), PURPLE, 1);
+        else drawText(r, x + CARD_W / 2, y + 174, 2.5f, "NO TIME YET", {150, 150, 150, 255}, 1);
+    }
+
+    fillRect(r, 0, 632, SCREEN_W, 76, {0, 0, 0, 120});
+    if ((tick / 60) % 2 == 0) drawText(r, SCREEN_W / 2, 644, 4, "PRESS ENTER TO DRIVE", WHITE, 1);
+    drawText(r, SCREEN_W / 2, 684, 2, "LEFT/RIGHT OR CLICK TO CHOOSE A CIRCUIT   ESC SETTINGS", {190, 190, 190, 255}, 1);
+}
+
+void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<WorldQuad>& quads,
+            const Minimap& mini, const Settings& set, const Menu& menu, bool paused, bool replay,
+            bool replayPaused, const Effects& fx, std::vector<SDL_Vertex>& verts) {
+    drawWorld(r, g, view, quads, set, set.ghost && !replay, fx, verts);  // in a replay the car is the ghost
+    drawHud(r, g, mini, set, menu, paused, replay, replayPaused);
     if (menu.open) drawMenu(r, menu, set);
 }
 
@@ -1966,11 +2031,16 @@ int runGame() {
     Effects fx;
     bool snapCamera = true;
 
+    Game demo;  // laps the circuit behind the title screen
+
     // Builds everything for the chosen circuit; the session's lap list starts afresh.
     auto loadTrack = [&]() {
         game = Game{};
         if (!basePath.empty()) game.savePath = basePath + TRACKS[set.track].saveFile;
         game.init(set.track);
+        demo = game;
+        demo.savePath.clear();
+        demo.resetToGrid();
         if (game.bestTime > 0) game.flash("BEST LAP TO BEAT " + fmtTime(game.bestTime), PURPLE, 4.0f);
         quads = buildTrackQuads(game);
         mini = Minimap{};
@@ -2018,6 +2088,34 @@ int runGame() {
     Rumble rumble;
     bool running = true, paused = false;
 
+    // Title screen, shown at launch. Each card shows a circuit and its record.
+    bool title = true;
+    double demoAcc = 0;
+    std::vector<TitleCard> cards(TRACK_COUNT);
+    for (int i = 0; i < TRACK_COUNT; ++i) {
+        Game peek;  // just the geometry and the saved record; no need for a racing line
+        peek.track.build(circuitLayout(i));
+        if (!basePath.empty()) {
+            peek.savePath = basePath + TRACKS[i].saveFile;
+            peek.load();
+        }
+        cards[i].best = peek.bestTime;
+        cards[i].outline.build(peek.track, cardX(i) + (CARD_W - CARD_MAP) / 2, CARD_Y + 10, CARD_MAP);
+    }
+    auto titleSelect = [&](int i) {
+        i = (i + TRACK_COUNT) % TRACK_COUNT;
+        if (set.track == i) return;
+        set.track = i;
+        changed();  // loads the circuit, demo car included
+    };
+    auto startDriving = [&]() {
+        title = false;
+        game.resetToGrid();
+        if (game.bestTime > 0) game.flash("BEST LAP TO BEAT " + fmtTime(game.bestTime), PURPLE, 4.0f);
+        snapCamera = true;
+        fx = Effects{};
+    };
+
     // Best-lap replay: a copy of the game whose car is driven from the ghost.
     Game replay;
     bool replaying = false, replayPaused = false;
@@ -2041,7 +2139,7 @@ int runGame() {
         replayAcc = 0;
         replay.puppetTo(replay.bestGhost, 0);
         replaying = true;
-        replayPaused = paused = menu.open = false;
+        replayPaused = paused = menu.open = title = false;
         snapCamera = true;
         fx = Effects{};
     };
@@ -2113,7 +2211,7 @@ int runGame() {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
             // Don't keep the clock running while the player is in another window.
-            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_FOCUS_LOST && !menu.open)
+            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_FOCUS_LOST && !menu.open && !title)
                 paused = true;
             if (e.type == SDL_KEYDOWN && menu.open) {
                 switch (e.key.keysym.scancode) {
@@ -2123,6 +2221,15 @@ int runGame() {
                     case SDL_SCANCODE_LEFT: case SDL_SCANCODE_A: menuAdjust(-1); break;
                     case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: menuAdjust(1); break;
                     case SDL_SCANCODE_RETURN: case SDL_SCANCODE_SPACE: if (!e.key.repeat) menuActivate(); break;
+                    default: break;
+                }
+            } else if (e.type == SDL_KEYDOWN && title) {
+                switch (e.key.keysym.scancode) {
+                    case SDL_SCANCODE_ESCAPE: if (!e.key.repeat) toggleMenu(); break;
+                    case SDL_SCANCODE_LEFT: case SDL_SCANCODE_A: titleSelect(set.track - 1); break;
+                    case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: titleSelect(set.track + 1); break;
+                    case SDL_SCANCODE_RETURN: case SDL_SCANCODE_SPACE: if (!e.key.repeat) startDriving(); break;
+                    case SDL_SCANCODE_F11: set.fullscreen = !set.fullscreen; changed(); break;
                     default: break;
                 }
             } else if (e.type == SDL_KEYDOWN && replaying) {
@@ -2150,6 +2257,11 @@ int runGame() {
                     case SDL_SCANCODE_F11: set.fullscreen = !set.fullscreen; changed(); break;
                     default: break;
                 }
+            }
+            if (title && !menu.open && e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                int i = cardAt(float(e.button.x), float(e.button.y));
+                if (i == set.track) startDriving();
+                else if (i >= 0) titleSelect(i);
             }
             if (menu.open && e.type == SDL_MOUSEMOTION) {
                 int i = menuRowAt(float(e.motion.x), float(e.motion.y));
@@ -2179,7 +2291,11 @@ int runGame() {
             if (e.type == SDL_CONTROLLERBUTTONDOWN) {
                 Uint8 b = e.cbutton.button;
                 if (b == SDL_CONTROLLER_BUTTON_BACK && !replaying) toggleMenu();
-                else if (replaying) {
+                else if (title && !menu.open) {
+                    if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT) titleSelect(set.track - 1);
+                    if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) titleSelect(set.track + 1);
+                    if (b == SDL_CONTROLLER_BUTTON_A || b == SDL_CONTROLLER_BUTTON_START) startDriving();
+                } else if (replaying) {
                     if (b == SDL_CONTROLLER_BUTTON_A) replayPaused = !replayPaused;
                     if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT) seekReplay(-3);
                     if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) seekReplay(3);
@@ -2203,7 +2319,7 @@ int runGame() {
         float frameDt = float(std::min(0.25, double(now - prev) / SDL_GetPerformanceFrequency()));
         acc += frameDt;
         prev = now;
-        if (paused || menu.open || replaying) acc = 0;
+        if (paused || menu.open || replaying || title) acc = 0;
         Input in = readInput(pad, set);
         while (acc >= DT) {
             game.step(in);
@@ -2219,7 +2335,9 @@ int runGame() {
             float t = replay.lapSteps * DT;
             replay.splitsDone = int(t >= replay.splits[0]) + int(t >= replay.splits[1]) + int(t >= replay.splits[2]);
         }
-        const Game& shownGame = replaying ? replay : game;
+        if (title && !menu.open) demoAcc += frameDt;
+        for (; demoAcc >= DT; demoAcc -= DT) demo.step(autopilot(demo));
+        const Game& shownGame = replaying ? replay : title ? demo : game;
         menu.bestTime = game.bestTime;
 
         updateCamera(view, shownGame, set, frameDt, snapCamera);
@@ -2228,7 +2346,7 @@ int runGame() {
         if (audio) {
             // Fade out while paused or in the menu.
             bool quiet = paused || menu.open || (replaying && replayPaused);
-            SoundParams sp = soundParams(shownGame, quiet ? 0.0f : set.volume / 100.0f);
+            SoundParams sp = soundParams(shownGame, quiet ? 0.0f : set.volume / 100.0f * (title ? 0.5f : 1.0f));
             SDL_LockAudioDevice(audio);
             synth.p = sp;
             SDL_UnlockAudioDevice(audio);
@@ -2239,11 +2357,19 @@ int runGame() {
         if (fx.shake > 0.3f)
             shown.cam = view.cam + Vec2{fx.rng.range(-1, 1), fx.rng.range(-1, 1)} * (fx.shake / view.zoom);
 
-        rumble.update(pad, shownGame, fx, set.vibration && !paused && !menu.open && !replaying);
-        // The mouse is only for the menu.
-        if (bool(SDL_ShowCursor(SDL_QUERY)) != menu.open) SDL_ShowCursor(menu.open ? SDL_ENABLE : SDL_DISABLE);
+        rumble.update(pad, shownGame, fx, set.vibration && !paused && !menu.open && !replaying && !title);
+        // The mouse is only for the menu and title screen.
+        bool wantCursor = menu.open || title;
+        if (bool(SDL_ShowCursor(SDL_QUERY)) != wantCursor) SDL_ShowCursor(wantCursor ? SDL_ENABLE : SDL_DISABLE);
 
-        render(r, shownGame, shown, quads, mini, set, menu, paused, replaying, replayPaused, fx, verts);
+        if (title) {
+            cards[set.track].best = game.bestTime;  // in case it was reset from the menu
+            drawWorld(r, demo, shown, quads, set, false, fx, verts);
+            drawTitle(r, cards, set.track, demo.stepCount);
+            if (menu.open) drawMenu(r, menu, set);
+        } else {
+            render(r, shownGame, shown, quads, mini, set, menu, paused, replaying, replayPaused, fx, verts);
+        }
         SDL_RenderPresent(r);
     }
 

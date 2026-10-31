@@ -32,7 +32,7 @@ Self-test (runs headless: on every circuit it checks the layout, then an autopil
 
 ## Circuits
 
-Choose the circuit at the top of the settings menu (Esc). Each one keeps its own best lap and ghost.
+Pick a circuit on the title screen (←/→ or click a card, then Enter), or later from the top of the settings menu (Esc). Each one keeps its own best lap and ghost, shown on its card. While you choose, a demo car laps the highlighted circuit on the racing line.
 
 | Circuit | Character |
 |---|---|
