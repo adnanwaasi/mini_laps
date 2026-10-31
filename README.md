@@ -48,6 +48,7 @@ Pick a circuit on the title screen (←/→ or click a card, then Enter), or lat
 | Brake / reverse | S / ↓ | LT |
 | Steer | A D / ← → | Left stick |
 | Handbrake (drift) | Space | A |
+| DRS (hold in a DRS zone) | E | RB |
 | Restart lap (back behind the line, timer cleared) | R / Enter | B / Start |
 | Cycle camera mode | C | Y |
 | Settings menu | Esc | Back |
@@ -96,7 +97,7 @@ Camera zoom applies in every mode. Look-ahead and zoom out with speed apply wher
 
 ## HUD
 
-The dash at the bottom shows speed, gear and throttle/brake bars. The 15 rev lights fill green, red, then blue as the revs rise, and flash blue at the shift point. The gearbox is automatic.
+The dash at the bottom shows speed, gear and throttle/brake bars. The 15 rev lights fill green, red, then blue as the revs rise, and flash blue at the shift point. The gearbox is automatic. The DRS light under the gear is dim outside a zone, outlined when DRS is available, and green when it's open.
 
 ## Rules
 
@@ -106,4 +107,5 @@ The dash at the bottom shows speed, gear and throttle/brake bars. The 15 rev lig
 - Each lap is split into 3 sectors (yellow lines). The sector deltas compare against your best lap: green is faster, red is slower. A sector time turns **purple** when it's the fastest you've ever driven that sector.
 - Once you have a best lap, the **DELTA** box at the top shows the live gap to it at your current spot on track (green means you're ahead).
 - **IDEAL** is your theoretical best: the sum of your best-ever sectors.
+- **DRS:** each circuit has DRS zones on its longest straights, marked by a dashed line with DRS painted on the track and shown green on the minimap. Hold E (RB) in a zone to open the rear wing for less drag and more top speed. It shuts as soon as you brake or the zone ends.
 - Your best valid lap, its ghost and your best sectors are saved next to the executable, one file per circuit (`best_lap.dat` for Parkland, `best_lap_coastline.dat`, `best_lap_harbour.dat`). Reset the current circuit's record from the settings menu, or delete the file.

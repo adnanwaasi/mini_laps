@@ -33,6 +33,10 @@ constexpr float REVERSE_SPEED = 150.0f;
 constexpr float BRAKE = 1350.0f;
 constexpr float MAX_LAT = 1500.0f;  // lateral grip limit
 constexpr float WHEELBASE = 32.0f;
+constexpr float DRS_TOP = 1.06f, DRS_DRAG = 0.6f;            // open rear wing: more top speed, less drag
+constexpr float DRS_MIN_RUN = 1400.0f, DRS_LEAD_IN = 150.0f;  // zone length needed, and where it starts
+constexpr size_t DRS_ZONES = 2;                              // per circuit, the longest straights
+constexpr int DRS_GRID_CLEAR = 90;                           // samples before the line kept DRS-free
 
 // Gearbox. It's cosmetic: it drives the HUD, rev lights and engine note, not the physics.
 constexpr int GEARS = 8;
@@ -133,7 +137,9 @@ struct Track {
     // or flat out, 1 = at the grip limit through a corner, 2 = braking.
     std::vector<Vec2> line;
     std::vector<float> lineSpeed;
+    std::vector<float> lineGrip;  // cornering limit alone, uncapped on the straights
     std::vector<uint8_t> lineZone;
+    std::vector<uint8_t> drsZone;  // 1 where the rear wing may be opened
 
     void buildRacingLine(float maxLat, float engine, float brake, float topSpeed) {
         const int N = size();
@@ -187,6 +193,8 @@ struct Track {
             k /= 7;
             vmax[i] = k > 1e-6f ? std::min(topSpeed, std::sqrt(maxLat / k)) : topSpeed;
         }
+        lineGrip.resize(N);
+        for (int i = 0; i < N; ++i) lineGrip[i] = vmax[i] < topSpeed ? vmax[i] : 1e9f;
         lineSpeed = vmax;
         for (int pass = 0; pass < 2 * N; ++pass) {
             int i = pass % N, j = (i + 1) % N;
@@ -203,6 +211,40 @@ struct Track {
             if (vn < v - 0.5f) lineZone[i] = 2;
             else if (v < topSpeed - 1 && v >= vmax[i] - 1) lineZone[i] = 1;
         }
+
+        // DRS zones: the longest nearly straight stretches the line takes flat
+        // out, at most DRS_ZONES of them. Each starts a little way in.
+        drsZone.assign(N, 0);
+        auto straight = [&](int i) { return lineZone[i] == 0 && curvature[i] < 0.0008f; };
+        int first = 0;
+        while (first < N && straight(first)) ++first;  // start scanning outside a run
+        if (first == N) return;
+        struct Run {
+            int start, end;
+            float len;
+        };
+        std::vector<Run> runs;
+        for (int k = 1; k <= N; ++k) {
+            int i = at(first + k);
+            if (!straight(i) || straight(at(i - 1))) continue;
+            Run run{i, i, 0};
+            while (straight(run.end)) {
+                run.len += ds[run.end];
+                run.end = at(run.end + 1);
+            }
+            if (run.len >= DRS_MIN_RUN) runs.push_back(run);
+        }
+        std::sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) { return a.len > b.len; });
+        if (runs.size() > DRS_ZONES) runs.resize(DRS_ZONES);
+        for (const Run& run : runs) {
+            float skip = 0;
+            for (int j = run.start; j != run.end; j = at(j + 1)) {
+                if (skip >= DRS_LEAD_IN) drsZone[j] = 1;
+                skip += ds[j];
+            }
+        }
+        // Not on the grid or over the start line: a zone there begins just after it.
+        for (int k = -DRS_GRID_CLEAR; k < 10; ++k) drsZone[at(k)] = 0;
     }
 
     // Distance along the lap at a hit, unwrapped so it stays continuous with
@@ -297,7 +339,7 @@ std::vector<Vec2> circuitLayout(int track = 0) {
 
 struct Input {
     float throttle = 0, brake = 0, steer = 0;
-    bool handbrake = false;
+    bool handbrake = false, drs = false;
 };
 
 struct Car {
@@ -352,6 +394,7 @@ struct Game {
     bool lapStarted = false, lapValid = true, offTrack = false, onGrass = false, onKerb = false;
     int gear = 0;  // -1 reverse, 0 neutral, 1..GEARS
     float rpm = IDLE_RPM;
+    bool drsOpen = false;
     int wallHits = 0;
     float lastImpact = 0;  // speed into the wall on the latest hit
     float wrongWayTime = 0;  // how long the car has been heading backwards round the lap
@@ -418,6 +461,7 @@ struct Game {
         car = Car{};
         wrongWayTime = 0;
         wrongWay = false;
+        drsOpen = false;
         gear = 0;
         rpm = IDLE_RPM;
         car.pos = track.pts[i];
@@ -555,7 +599,12 @@ struct Game {
         onGrass = here.dist > HALF_W + KERB_W;
         onKerb = here.dist > HALF_W && !onGrass;
         float grip = onGrass ? 0.5f : 1.0f;
-        float top = onGrass ? GRASS_TOP : TOP_SPEED;
+        // DRS: the wing opens while the button is held in a zone, and shuts on
+        // the brakes or at the end of the zone.
+        bool drsZone = track.drsZone[here.seg];
+        if (!drsZone || in.brake > 0 || onGrass) drsOpen = false;
+        else if (in.drs) drsOpen = true;
+        float top = onGrass ? GRASS_TOP : TOP_SPEED * (drsOpen ? DRS_TOP : 1.0f);
 
         // The steering wheel turns at a finite rate so keyboard input feels smooth.
         float steerRate = (std::fabs(in.steer) < std::fabs(car.steer) ? 7.0f : 4.5f) * steerSpeed;
@@ -569,7 +618,7 @@ struct Game {
             else vf = std::max(-REVERSE_SPEED, vf - in.brake * 300.0f * DT);
         }
         if (in.handbrake) vf -= signOf(vf) * std::min(std::fabs(vf), 350.0f * DT);
-        vf -= vf * (0.10f + (onGrass ? 1.4f : 0.0f)) * DT;
+        vf -= vf * (0.10f * (drsOpen ? DRS_DRAG : 1.0f) + (onGrass ? 1.4f : 0.0f)) * DT;
         if (in.throttle == 0 && in.brake == 0) vf -= signOf(vf) * std::min(std::fabs(vf), 40.0f * DT);
 
         // Yaw from a simple bicycle model, capped by available grip.
@@ -679,6 +728,7 @@ struct Game {
         }
         TrackHit h = track.nearest(pos, idx, jumped ? -1 : 40);
         idx = h.seg;
+        drsOpen = track.drsZone[idx] && vf > TOP_SPEED * 0.9f && lastInput.brake == 0;
         onGrass = h.dist > HALF_W + KERB_W;
         onKerb = h.dist > HALF_W && !onGrass;
         lapStarted = true;
@@ -863,7 +913,7 @@ void audioCallback(void* userdata, Uint8* stream, int len) {
 
 // Simple pure-pursuit driver used by --selftest to check the game is lappable.
 // It follows the racing line at the line's own speeds.
-Input autopilot(const Game& g) {
+Input autopilot(const Game& g, bool useDrs = true) {
     const Track& t = g.track;
     const int N = t.size();
     float speed = length(g.car.vel);
@@ -871,14 +921,20 @@ Input autopilot(const Game& g) {
     Vec2 d = target - g.car.pos;
     float diff = std::remainder(std::atan2(d.y, d.x) - g.car.heading, 2.0f * float(M_PI));
 
-    float limit = 1e9f;
-    for (int k = 0; k < 5; ++k) limit = std::min(limit, t.lineSpeed[(g.idx + k) % N]);
+    // The fastest speed from which the car can still brake for every corner ahead.
+    float limit = 1e9f, dist = 0;
+    for (int k = 0; k < 160; ++k) {
+        int j = (g.idx + k) % N;
+        limit = std::min(limit, std::sqrt(t.lineGrip[j] * t.lineGrip[j] + 2.0f * BRAKE * 0.8f * dist));
+        dist += length(t.line[(j + 1) % N] - t.line[j]);
+    }
     Vec2 fwd{std::cos(g.car.heading), std::sin(g.car.heading)};
     float vf = dot(g.car.vel, fwd);
     Input in;
     in.steer = std::clamp(diff * 3.0f, -1.0f, 1.0f);
     in.throttle = std::clamp((limit - vf) / 20.0f, 0.0f, 1.0f);
     in.brake = std::clamp((vf - limit - 5.0f) / 20.0f, 0.0f, 1.0f);
+    in.drs = useDrs;
     return in;
 }
 
@@ -957,6 +1013,20 @@ bool testTrack(int id) {
 
     std::printf("gearbox: top gear %d, %d shifts, rpm %.0f-%.0f\n", topGear, shifts, rpmLo, rpmHi);
     ok = ok && topGear >= 5 && shifts >= topGear && rpmLo >= IDLE_RPM - 1 && rpmHi <= MAX_RPM + 1;
+
+    // Every circuit has DRS on at least one straight, and using it saves time.
+    int zones = 0;
+    float zoneLen = 0;
+    for (int i = 0; i < N; ++i) {
+        zones += t.drsZone[i] && !t.drsZone[(i - 1 + N) % N];
+        if (t.drsZone[i]) zoneLen += length(t.pts[(i + 1) % N] - t.pts[i]);
+    }
+    Game noDrs;
+    noDrs.init(id);
+    for (long s = 0; s < 120L * 600 && noDrs.history.size() < 2; ++s) noDrs.step(autopilot(noDrs, false));
+    std::printf("drs: %d zone(s), %.0f px; best lap %s with it, %s without\n", zones, zoneLen,
+                fmtTime(g.bestTime).c_str(), fmtTime(noDrs.bestTime).c_str());
+    ok = ok && zones >= 1 && noDrs.bestTime > g.bestTime;
 
     // Save round trip, in the current format and the old v1 one (no best-ever sectors).
     for (uint32_t version : {SAVE_VERSION, 1u}) {
@@ -1185,7 +1255,7 @@ void pushBox(std::vector<SDL_Vertex>& out, const View& v, Vec2 pos, float headin
 }
 
 void pushCar(std::vector<SDL_Vertex>& out, const View& v, Vec2 pos, float heading, float steer, SDL_Color body,
-             Uint8 alpha) {
+             Uint8 alpha, bool wingOpen = false) {
     SDL_Color tyre{25, 25, 28, alpha}, dark{30, 30, 40, alpha}, helmet{255, 210, 40, alpha};
     body.a = alpha;
     pushBox(out, v, pos, heading, -14, -11, 5.5f, 3.8f, tyre);
@@ -1197,7 +1267,12 @@ void pushCar(std::vector<SDL_Vertex>& out, const View& v, Vec2 pos, float headin
     pushBox(out, v, pos, heading, 1, 0, 21, 3.5f, body);        // chassis + nose
     pushBox(out, v, pos, heading, -5, 0, 9, 7.5f, body);        // sidepods
     pushBox(out, v, pos, heading, 22, 0, 2, 11.5f, body);       // front wing
-    pushBox(out, v, pos, heading, -21, 0, 2.5f, 9, dark);       // rear wing
+    if (wingOpen) {  // DRS: the flap lifts, leaving a slot in the rear wing
+        pushBox(out, v, pos, heading, -22.5f, 0, 1, 9, dark);
+        pushBox(out, v, pos, heading, -19.5f, 0, 1, 9, dark);
+    } else {
+        pushBox(out, v, pos, heading, -21, 0, 2.5f, 9, dark);   // rear wing
+    }
     pushBox(out, v, pos, heading, 1, 0, 4.5f, 2.8f, dark);      // cockpit
     pushBox(out, v, pos, heading, 0, 0, 2.2f, 2.2f, helmet);    // driver
 }
@@ -1398,6 +1473,26 @@ std::vector<WorldQuad> buildTrackQuads(const Game& g) {
         across(i, -26, 30, o + 19, o + 22, paint);
     }
 
+    // DRS activation: a dashed line across the track with DRS painted after it,
+    // upright for the driver.
+    for (int i = 0; i < N; ++i) {
+        if (!t.drsZone[i] || t.drsZone[(i - 1 + N) % N]) continue;
+        const SDL_Color white{240, 240, 240, 190};
+        for (float o = -HALF_W; o < HALF_W; o += 18) across(i, -2, 2, o, std::min(o + 10, HALF_W), white);
+        const float S = 7, W = 11 * S;
+        Vec2 u = t.normals[i], f = t.tangent(i);
+        Vec2 topLeft = t.pts[i] + f * (24 + 5 * S) - u * (W / 2);
+        const char* text = "DRS";
+        for (int c = 0; c < 3; ++c) {
+            const char* g = glyph(text[c]);
+            for (int k = 0; k < 15; ++k) {
+                if (g[k] != '1') continue;
+                Vec2 a = topLeft + u * ((c * 4 + k % 3) * S) - f * ((k / 3) * S);
+                q.push_back({{a, a + u * S, a + u * S - f * S, a - f * S}, white});
+            }
+        }
+    }
+
     addScenery(t, q);
     return q;
 }
@@ -1453,6 +1548,7 @@ struct Minimap {
     float x, y, scale;
     Vec2 origin;
     std::vector<SDL_FPoint> line;
+    std::vector<std::vector<SDL_FPoint>> drs;  // one polyline per DRS zone
 
     void build(const Track& t, float bx, float by, float size) {
         Vec2 lo{1e9f, 1e9f}, hi{-1e9f, -1e9f};
@@ -1466,6 +1562,12 @@ struct Minimap {
         y = by + (size - (hi.y - lo.y) * scale) / 2;
         for (Vec2 p : t.pts) line.push_back(map(p));
         line.push_back(line.front());
+        const int N = t.size();
+        for (int i = 0; i < int(t.drsZone.size()); ++i) {
+            if (!t.drsZone[i] || t.drsZone[(i - 1 + N) % N]) continue;
+            drs.emplace_back();
+            for (int j = i; t.drsZone[j % N] && int(drs.back().size()) <= N; ++j) drs.back().push_back(map(t.pts[j % N]));
+        }
     }
     SDL_FPoint map(Vec2 p) const { return {x + (p.x - origin.x) * scale, y + (p.y - origin.y) * scale}; }
 };
@@ -1691,7 +1793,7 @@ void drawWorld(SDL_Renderer* r, const Game& g, const View& view, const std::vect
         pushCar(verts, view, {s.x, s.y}, s.h, 0, {150, 200, 255, 255}, 90);
     }
     pushCarShadow(verts, view, g.car.pos, g.car.heading);
-    pushCar(verts, view, g.car.pos, g.car.heading, g.car.steer, {220, 30, 40, 255}, 255);
+    pushCar(verts, view, g.car.pos, g.car.heading, g.car.steer, {220, 30, 40, 255}, 255, g.drsOpen);
     SDL_RenderGeometry(r, nullptr, verts.data(), int(verts.size()), nullptr, 0);
 }
 
@@ -1710,6 +1812,12 @@ void drawHud(SDL_Renderer* r, const Game& g, const Minimap& mini, const Settings
             SDL_RenderDrawLinesF(r, shifted.data(), int(shifted.size()));
             for (auto& p : shifted) p.x += 1;
         }
+        SDL_SetRenderDrawColor(r, GREEN.r, GREEN.g, GREEN.b, 255);
+        for (std::vector<SDL_FPoint> zone : mini.drs)
+            for (int d = 0; d < 3; ++d) {
+                SDL_RenderDrawLinesF(r, zone.data(), int(zone.size()));
+                for (auto& p : zone) p.y += 1;
+            }
         SDL_FPoint sl = mini.map(g.track.pts[0]);
         fillRect(r, sl.x - 2, sl.y - 5, 4, 10, WHITE);
         if (ghostVisible) {
@@ -1803,6 +1911,17 @@ void drawHud(SDL_Renderer* r, const Game& g, const Minimap& mini, const Settings
 
     drawText(r, cx + 40, top + 30, 8, std::to_string(shownSpeed), WHITE, 2);
     drawText(r, cx + 40, top + 78, 2.5f, set.mph ? "MPH" : "KM/H", {180, 180, 180, 255}, 2);
+    // DRS light: dim outside a zone, outlined when it can open, green when open.
+    bool drsReady = g.track.drsZone[g.idx] && !g.onGrass;
+    SDL_Color drsCol = g.drsOpen ? GREEN : drsReady ? WHITE : SDL_Color{70, 70, 80, 255};
+    if (g.drsOpen) fillRect(r, cx + 56, top + 84, 52, 20, GREEN);
+    else {
+        fillRect(r, cx + 56, top + 84, 52, 2, drsCol);
+        fillRect(r, cx + 56, top + 102, 52, 2, drsCol);
+        fillRect(r, cx + 56, top + 84, 2, 20, drsCol);
+        fillRect(r, cx + 106, top + 84, 2, 20, drsCol);
+    }
+    drawText(r, cx + 82, top + 88, 2.5f, "DRS", g.drsOpen ? SDL_Color{10, 30, 10, 255} : drsCol, 1);
     fillRect(r, cx + 56, top + 26, 52, 52, {255, 255, 255, 20});
     drawText(r, cx + 82, top + 32, 8, gear, GOLD, 1);
     float tb = g.lastInput.throttle * 74, bb = g.lastInput.brake * 74;
@@ -1948,6 +2067,7 @@ Input readInput(SDL_GameController* pad, const Settings& set) {
     in.brake = (k[SDL_SCANCODE_S] || k[SDL_SCANCODE_DOWN]) ? 1.0f : 0.0f;
     in.steer = float((k[SDL_SCANCODE_D] || k[SDL_SCANCODE_RIGHT]) - (k[SDL_SCANCODE_A] || k[SDL_SCANCODE_LEFT]));
     in.handbrake = k[SDL_SCANCODE_SPACE];
+    in.drs = k[SDL_SCANCODE_E];
     if (pad) {
         auto axis = [&](SDL_GameControllerAxis a) { return SDL_GameControllerGetAxis(pad, a) / 32767.0f; };
         float lx = axis(SDL_CONTROLLER_AXIS_LEFTX);
@@ -1956,6 +2076,7 @@ Input readInput(SDL_GameController* pad, const Settings& set) {
         in.throttle = std::max(in.throttle, axis(SDL_CONTROLLER_AXIS_TRIGGERRIGHT));
         in.brake = std::max(in.brake, axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT));
         in.handbrake = in.handbrake || SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A);
+        in.drs = in.drs || SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
     }
     return in;
 }
