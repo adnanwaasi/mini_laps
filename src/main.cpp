@@ -177,6 +177,7 @@ struct LapEntry {
 constexpr uint32_t SAVE_MAGIC = 0x4C484631;  // "1FHL"
 constexpr uint32_t SAVE_VERSION = 2;         // v2 adds the best-ever sectors; v1 still loads
 constexpr int GRID_OFFSET = 40;  // samples behind the line for the run-up
+constexpr float GRID_SLOT = HALF_W * 0.45f;  // sideways offset of the staggered grid slots
 constexpr int CROSS_BAND = 60;   // samples either side of a line that count as "at" it
 constexpr size_t MAX_SKIDS = 6000;
 
@@ -278,6 +279,7 @@ struct Game {
 
     void resetToGrid() {
         placeAt(track.size() - GRID_OFFSET);
+        car.pos = car.pos + track.normals[idx] * GRID_SLOT;
         lapStarted = false;
         lapValid = true;
         nextCp = 3;
@@ -483,8 +485,12 @@ struct Game {
             }
         }
         if (crossedFwd) {
-            if (!lapStarted) startLap();
-            else if (nextCp == 3) finishLap();
+            if (!lapStarted) {
+                startLap();
+                messageTimer = 0;  // the "cross the line" prompt has done its job
+            } else if (nextCp == 3) {
+                finishLap();
+            }
         }
         if (crossedBack && lapStarted) {
             lapValid = false;
@@ -890,6 +896,10 @@ struct View {
         Vec2 d = p - cam;
         return {(d.x * cosA - d.y * sinA) * zoom + SCREEN_W * 0.5f, (d.x * sinA + d.y * cosA) * zoom + SCREEN_H * 0.5f};
     }
+    Vec2 toWorld(Vec2 s) const {
+        Vec2 u{(s.x - SCREEN_W * 0.5f) / zoom, (s.y - SCREEN_H * 0.5f) / zoom};
+        return cam + Vec2{u.x * cosA + u.y * sinA, -u.x * sinA + u.y * cosA};
+    }
 };
 
 void pushQuad(std::vector<SDL_Vertex>& out, Vec2 a, Vec2 b, Vec2 c, Vec2 d, SDL_Color col) {
@@ -922,10 +932,116 @@ void pushCar(std::vector<SDL_Vertex>& out, const View& v, Vec2 pos, float headin
     pushBox(out, v, pos, heading, 0, 0, 2.2f, 2.2f, helmet);    // driver
 }
 
+// Soft drop shadow under the car, offset down-right on screen.
+void pushCarShadow(std::vector<SDL_Vertex>& out, const View& v, Vec2 pos, float heading) {
+    size_t first = out.size();
+    const SDL_Color shade{0, 0, 0, 70};
+    pushBox(out, v, pos, heading, 0, 0, 23, 12, shade);
+    pushBox(out, v, pos, heading, -5, 0, 10, 8.5f, shade);
+    for (size_t k = first; k < out.size(); ++k) {
+        out[k].position.x += 4 * v.zoom;
+        out[k].position.y += 6 * v.zoom;
+    }
+}
+
 struct WorldQuad {
     Vec2 v[4];
     SDL_Color c;
 };
+
+// Small deterministic RNG so the scenery is the same every time.
+struct Rng {
+    uint32_t s;
+    float next() {
+        s = s * 1664525u + 1013904223u;
+        return float(s >> 8) / 16777216.0f;
+    }
+    float range(float lo, float hi) { return lo + (hi - lo) * next(); }
+};
+
+// Is p inside the loop traced by the centre line? (even-odd ray cast)
+bool insideLoop(const Track& t, Vec2 p) {
+    bool in = false;
+    for (int i = 0, n = t.size(), j = n - 1; i < n; j = i++) {
+        Vec2 a = t.pts[i], b = t.pts[j];
+        if ((a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y)) in = !in;
+    }
+    return in;
+}
+
+// Octagon as four quads fanned from the centre.
+void pushBlob(std::vector<WorldQuad>& q, Vec2 c, float r, SDL_Color col) {
+    Vec2 rim[8];
+    for (int k = 0; k < 8; ++k) {
+        float a = k * float(M_PI) / 4 + 0.39f;
+        rim[k] = c + Vec2{std::cos(a), std::sin(a)} * r;
+    }
+    for (int k = 0; k < 8; k += 2) q.push_back({{c, rim[k], rim[k + 1], rim[(k + 2) % 8]}, col});
+}
+
+// A grandstand along the outside of the main straight, and trees in the
+// spare ground beyond the tyre walls.
+void addScenery(const Track& t, std::vector<WorldQuad>& q) {
+    const int N = t.size();
+    Rng rng{20261024u};
+
+    int standA = 0, standB = 0;
+    while (standA < N && t.arc[standA] < 300) ++standA;
+    standB = standA;
+    while (standB < N && t.arc[standB] < 1700) ++standB;
+    float side = insideLoop(t, t.pts[standA] + t.normals[standA] * (WALL_D + 90)) ? -1.0f : 1.0f;
+    const float s0 = WALL_D + 40, rowW = 22;
+    const int rows = 5;
+    auto standPt = [&](int i, float off) { return t.pts[i] + t.normals[i] * (side * off); };
+    for (int i = standA; i < standB; ++i) {
+        int j = i + 1;
+        q.push_back({{standPt(i, s0 - 8), standPt(i, s0 + rows * rowW + 14), standPt(j, s0 + rows * rowW + 14),
+                      standPt(j, s0 - 8)},
+                     {95, 98, 110, 255}});
+        for (int row = 0; row < rows; ++row) {
+            float o = s0 + row * rowW + 4;
+            q.push_back({{standPt(i, o), standPt(i, o + rowW - 6), standPt(j, o + rowW - 6), standPt(j, o)},
+                         {60, 62, 72, 255}});
+            // Spectators: a couple of coloured dots per seat block.
+            for (int k = 0; k < 2; ++k) {
+                if (rng.next() < 0.25f) continue;
+                Vec2 c = standPt(i, o + rowW * 0.35f) + t.tangent(i) * (k * 6.0f - 3.0f);
+                SDL_Color shirt{Uint8(rng.range(60, 255)), Uint8(rng.range(60, 255)), Uint8(rng.range(60, 255)), 255};
+                q.push_back({{c + Vec2{-2.5f, -2.5f}, c + Vec2{2.5f, -2.5f}, c + Vec2{2.5f, 2.5f}, c + Vec2{-2.5f, 2.5f}},
+                             shirt});
+            }
+        }
+    }
+
+    Vec2 lo{1e9f, 1e9f}, hi{-1e9f, -1e9f};
+    for (Vec2 p : t.pts) {
+        lo = {std::min(lo.x, p.x), std::min(lo.y, p.y)};
+        hi = {std::max(hi.x, p.x), std::max(hi.y, p.y)};
+    }
+    struct Tree {
+        Vec2 p;
+        float r;
+    };
+    std::vector<Tree> trees;
+    for (int tries = 0; tries < 5000 && trees.size() < 420; ++tries) {
+        Vec2 p{rng.range(lo.x - 900, hi.x + 900), rng.range(lo.y - 900, hi.y + 900)};
+        float r = rng.range(16, 38);
+        TrackHit h = t.nearest(p, 0, -1);
+        if (h.dist < WALL_D + 30 + r || h.dist > WALL_D + 900) continue;
+        if (h.seg >= standA - 10 && h.seg <= standB + 10 && h.dist < s0 + rows * rowW + 40 + r) continue;
+        bool clear = true;
+        for (const Tree& o : trees) clear = clear && length(o.p - p) > (o.r + r) * 0.8f;
+        if (clear) trees.push_back({p, r});
+    }
+    for (const Tree& tr : trees) pushBlob(q, tr.p + Vec2{6, 9}, tr.r, {0, 0, 0, 60});
+    for (const Tree& tr : trees) {
+        float shade = rng.range(0.8f, 1.15f);
+        SDL_Color leaf{Uint8(34 * shade), Uint8(92 * shade), Uint8(40 * shade), 255};
+        SDL_Color light{Uint8(52 * shade), Uint8(122 * shade), Uint8(52 * shade), 255};
+        pushBlob(q, tr.p, tr.r, leaf);
+        pushBlob(q, tr.p - Vec2{tr.r * 0.22f, tr.r * 0.22f}, tr.r * 0.55f, light);
+    }
+}
 
 std::vector<WorldQuad> buildTrackQuads(const Game& g) {
     const Track& t = g.track;
@@ -943,19 +1059,21 @@ std::vector<WorldQuad> buildTrackQuads(const Game& g) {
             q.push_back({{a, b, c, d}, colorAt(i)});
         }
     };
-    auto solid = [](SDL_Color c) { return [c](int) { return c; }; };
     auto barrier = [](int i) { return (i / 4) % 4 == 0 ? SDL_Color{200, 50, 45, 255} : SDL_Color{45, 45, 50, 255}; };
     auto kerb = [&](int i) {
         if (t.curvature[i] < 0.0012f) return SDL_Color{230, 230, 230, 255};
         return (i / 2) % 2 ? SDL_Color{215, 40, 40, 255} : SDL_Color{240, 240, 240, 255};
     };
+    // Mowing stripes on the runoff and faint bands in the asphalt give a sense of speed.
+    auto runoff = [](int i) { return (i / 8) % 2 ? SDL_Color{78, 150, 64, 255} : SDL_Color{72, 141, 59, 255}; };
+    auto asphalt = [](int i) { return (i / 6) % 2 ? SDL_Color{72, 72, 78, 255} : SDL_Color{68, 68, 74, 255}; };
 
-    band(-WALL_D, WALL_D, solid({78, 150, 64, 255}), false);
+    band(-WALL_D, WALL_D, runoff, false);
     band(WALL_D, WALL_D + 10, barrier, true);
     band(-WALL_D - 10, -WALL_D, barrier, true);
     band(HALF_W, HALF_W + KERB_W, kerb, false);
     band(-HALF_W - KERB_W, -HALF_W, kerb, false);
-    band(-HALF_W, HALF_W, solid({72, 72, 78, 255}), false);
+    band(-HALF_W, HALF_W, asphalt, false);
 
     auto across = [&](int i, float along0, float along1, float o1, float o2, SDL_Color c) {
         Vec2 tan = t.tangent(i), n = t.normals[i], p = t.pts[i];
@@ -971,8 +1089,69 @@ std::vector<WorldQuad> buildTrackQuads(const Game& g) {
             SDL_Color c = (row + col) % 2 ? SDL_Color{20, 20, 20, 255} : SDL_Color{245, 245, 245, 255};
             across(0, -8.0f + row * 8, row * 8.0f, -HALF_W + col * cw, -HALF_W + (col + 1) * cw, c);
         }
+
+    // Staggered grid slots behind the line; the player starts in the second one.
+    const SDL_Color paint{235, 235, 235, 200};
+    for (int k = 1; k <= 4; ++k) {
+        int i = N - k * GRID_OFFSET / 2;
+        float o = (k % 2 ? -GRID_SLOT : GRID_SLOT);
+        across(i, 27, 30, o - 22, o + 22, paint);
+        across(i, -26, 30, o - 22, o - 19, paint);
+        across(i, -26, 30, o + 19, o + 22, paint);
+    }
+
+    addScenery(t, q);
     return q;
 }
+
+// Tyre smoke, grass dust and camera shake. Purely visual, so it lives outside Game.
+struct Particle {
+    Vec2 pos, vel;
+    float age, life, size;
+    SDL_Color c;
+};
+
+struct Effects {
+    std::vector<Particle> parts;
+    float shake = 0, smokeAcc = 0, dustAcc = 0;
+    int seenHits = 0;
+    Rng rng{7u};
+
+    void update(const Game& g, float dt) {
+        for (Particle& p : parts) {
+            p.age += dt;
+            p.pos = p.pos + p.vel * dt;
+            p.vel = p.vel * std::exp(-2.5f * dt);
+        }
+        parts.erase(std::remove_if(parts.begin(), parts.end(), [](const Particle& p) { return p.age >= p.life; }),
+                    parts.end());
+        shake *= std::exp(-9.0f * dt);
+        if (g.wallHits != seenHits) {
+            seenHits = g.wallHits;
+            shake = std::min(g.lastImpact / 40.0f, 14.0f);
+        }
+        if (dt <= 0) return;
+
+        float speed = length(g.car.vel), slip = std::fabs(g.car.slip);
+        float smoke = g.onGrass ? 0.0f
+                                : std::max(std::clamp((slip - 160.0f) / 300.0f, 0.0f, 1.0f),
+                                           g.lastInput.handbrake && speed > 120 ? 0.6f : 0.0f);
+        float dust = g.onGrass ? std::min(speed / 400.0f, 1.0f) : 0.0f;
+        smokeAcc += smoke * 70.0f * dt;
+        dustAcc += dust * 60.0f * dt;
+        Vec2 f{std::cos(g.car.heading), std::sin(g.car.heading)}, r{-f.y, f.x};
+        auto spawn = [&](float& acc, SDL_Color c, float size) {
+            for (; acc >= 1; acc -= 1) {
+                if (parts.size() >= 400) continue;
+                Vec2 wheel = g.car.pos - f * 14.0f + r * (rng.next() < 0.5f ? 11.0f : -11.0f);
+                Vec2 jitter{rng.range(-30, 30), rng.range(-30, 30)};
+                parts.push_back({wheel, g.car.vel * 0.15f + jitter, 0, rng.range(0.6f, 1.2f), size, c});
+            }
+        };
+        spawn(smokeAcc, {215, 215, 220, 255}, 7);
+        spawn(dustAcc, {140, 115, 70, 255}, 6);
+    }
+};
 
 struct Minimap {
     float x, y, scale;
@@ -1121,14 +1300,32 @@ void drawMenu(SDL_Renderer* r, const Menu& menu, const Settings& s) {
 }
 
 void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<WorldQuad>& quads,
-            const Minimap& mini, const Settings& set, const Menu& menu, bool paused,
+            const Minimap& mini, const Settings& set, const Menu& menu, bool paused, const Effects& fx,
             std::vector<SDL_Vertex>& verts) {
     const bool showGhost = set.ghost;
     SDL_SetRenderDrawColor(r, 40, 96, 48, 255);
     SDL_RenderClear(r);
 
-    // Track (culled to what's roughly on screen).
+    // Wide mowing stripes on the ground beyond the walls, so there's always
+    // something moving past even far from the track.
     verts.clear();
+    {
+        Vec2 lo{1e9f, 1e9f}, hi{-1e9f, -1e9f};
+        for (Vec2 s : {Vec2{0, 0}, Vec2{SCREEN_W, 0}, Vec2{0, SCREEN_H}, Vec2{SCREEN_W, SCREEN_H}}) {
+            Vec2 w = view.toWorld(s);
+            lo = {std::min(lo.x, w.x), std::min(lo.y, w.y)};
+            hi = {std::max(hi.x, w.x), std::max(hi.y, w.y)};
+        }
+        const float STRIPE = 260;
+        for (int k = int(std::floor(lo.x / STRIPE)); k * STRIPE < hi.x; ++k) {
+            if (k % 2 == 0) continue;
+            float x0 = k * STRIPE, x1 = x0 + STRIPE;
+            pushQuad(verts, view.toScreen({x0, lo.y}), view.toScreen({x1, lo.y}), view.toScreen({x1, hi.y}),
+                     view.toScreen({x0, hi.y}), {44, 104, 52, 255});
+        }
+    }
+
+    // Track and scenery (culled to what's roughly on screen).
     float cull = std::hypot(SCREEN_W * 0.5f, SCREEN_H * 0.5f) / view.zoom + 450;
     for (const WorldQuad& q : quads) {
         if (length(q.v[0] - view.cam) > cull) continue;
@@ -1150,13 +1347,23 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
         SDL_RenderFillRectsF(r, marks.data(), int(marks.size()));
     }
 
-    // Ghost of the best lap, then the player.
+    // Smoke and dust: puffs that grow and fade.
     verts.clear();
+    for (const Particle& p : fx.parts) {
+        float t = p.age / p.life, s = p.size * (1.0f + 2.5f * t) * view.zoom;
+        Vec2 c = view.toScreen(p.pos);
+        SDL_Color col = p.c;
+        col.a = Uint8(110 * (1.0f - t));
+        pushQuad(verts, c + Vec2{-s, -s}, c + Vec2{s, -s}, c + Vec2{s, s}, c + Vec2{-s, s}, col);
+    }
+
+    // Ghost of the best lap, then the player.
     bool ghostVisible = showGhost && g.lapStarted && g.lapSteps < int(g.bestGhost.size());
     if (ghostVisible) {
         const GhostSample& s = g.bestGhost[g.lapSteps];
         pushCar(verts, view, {s.x, s.y}, s.h, 0, {150, 200, 255, 255}, 90);
     }
+    pushCarShadow(verts, view, g.car.pos, g.car.heading);
     pushCar(verts, view, g.car.pos, g.car.heading, g.car.steer, {220, 30, 40, 255}, 255);
     SDL_RenderGeometry(r, nullptr, verts.data(), int(verts.size()), nullptr, 0);
 
@@ -1423,6 +1630,7 @@ int runGame() {
 
     SDL_GameController* pad = nullptr;
     Menu menu;
+    Effects fx;
     bool running = true, paused = false;
 
     auto menuMove = [&](int dir) {
@@ -1571,7 +1779,12 @@ int runGame() {
             SDL_UnlockAudioDevice(audio);
         }
 
-        render(r, game, view, quads, mini, set, menu, paused, verts);
+        fx.update(game, paused || menu.open ? 0.0f : frameDt);
+        View shown = view;
+        if (fx.shake > 0.3f)
+            shown.cam = view.cam + Vec2{fx.rng.range(-1, 1), fx.rng.range(-1, 1)} * (fx.shake / view.zoom);
+
+        render(r, game, shown, quads, mini, set, menu, paused, fx, verts);
         SDL_RenderPresent(r);
     }
 
