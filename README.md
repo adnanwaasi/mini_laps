@@ -79,5 +79,7 @@ Camera zoom applies in every mode. Look-ahead and zoom out with speed apply wher
 - You start on an out lap. Timing begins when you cross the chequered line.
 - **Track limits:** kerbs count as track. If the car goes fully past the kerb, the lap is marked **INVALID** and doesn't count toward your record. Grass slows you down, and tyre walls stop you.
 - Press R at any time to abandon the lap and start a fresh one from behind the line. Driving backwards over the line invalidates the lap.
-- Each lap is split into 3 sectors (yellow lines). The sector deltas compare against your best lap: green is faster, red is slower.
-- Your best valid lap and its ghost are saved to `best_lap.dat` next to the executable. Reset it from the settings menu, or delete the file.
+- Each lap is split into 3 sectors (yellow lines). The sector deltas compare against your best lap: green is faster, red is slower. A sector time turns **purple** when it's the fastest you've ever driven that sector.
+- Once you have a best lap, the **DELTA** box at the top shows the live gap to it at your current spot on track (green means you're ahead).
+- **IDEAL** is your theoretical best: the sum of your best-ever sectors.
+- Your best valid lap, its ghost and your best sectors are saved to `best_lap.dat` next to the executable. Reset them from the settings menu, or delete the file.

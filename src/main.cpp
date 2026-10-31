@@ -62,6 +62,7 @@ struct TrackHit {
 struct Track {
     std::vector<Vec2> pts, normals;
     std::vector<float> curvature;
+    std::vector<float> arc;  // distance from the start line to each sample
     float length = 0;
 
     void build(const std::vector<Vec2>& ctrl) {
@@ -82,11 +83,13 @@ struct Track {
         const int N = int(pts.size());
         normals.resize(N);
         curvature.assign(N, 0.0f);
+        arc.resize(N);
         std::vector<float> raw(N);
         for (int i = 0; i < N; ++i) {
             Vec2 prev = pts[(i - 1 + N) % N], next = pts[(i + 1) % N];
             Vec2 t = normalized(next - prev);
             normals[i] = {-t.y, t.x};
+            arc[i] = length;
             length += ::length(next - pts[i]);
             Vec2 a = pts[i] - prev, b = next - pts[i];
             float turn = std::fabs(std::atan2(cross(a, b), dot(a, b)));
@@ -118,6 +121,15 @@ struct Track {
             if (d < best.dist) best = {i, d, c};
         }
         return best;
+    }
+
+    // Distance along the lap at a hit, unwrapped so it stays continuous with
+    // prev (just past the line reads as length + a bit, not ~0).
+    float distanceAt(const TrackHit& h, float prev) const {
+        float d = arc[h.seg] + ::length(h.closest - pts[h.seg]);
+        while (d - prev > length * 0.5f) d -= length;
+        while (prev - d > length * 0.5f) d += length;
+        return d;
     }
 };
 
@@ -158,7 +170,7 @@ struct LapEntry {
 };
 
 constexpr uint32_t SAVE_MAGIC = 0x4C484631;  // "1FHL"
-constexpr uint32_t SAVE_VERSION = 1;
+constexpr uint32_t SAVE_VERSION = 2;         // v2 adds the best-ever sectors; v1 still loads
 constexpr int GRID_OFFSET = 40;  // samples behind the line for the run-up
 constexpr int CROSS_BAND = 60;   // samples either side of a line that count as "at" it
 constexpr size_t MAX_SKIDS = 6000;
@@ -178,8 +190,10 @@ std::string fmtTime(float s) {
 }
 
 std::string fmtDelta(float d) {
+    // Round first so a tiny negative gap reads +0.000, not -0.000.
+    long ms = std::lround(d * 1000.0f);
     char buf[32];
-    std::snprintf(buf, sizeof buf, "%c%.3f", d < 0 ? '-' : '+', std::fabs(d));
+    std::snprintf(buf, sizeof buf, "%c%ld.%03ld", ms < 0 ? '-' : '+', std::labs(ms) / 1000, std::labs(ms) % 1000);
     return buf;
 }
 
@@ -192,7 +206,10 @@ struct Game {
     int nextCp = 3, lapSteps = 0, lapNumber = 0, splitsDone = 0;
     float splits[3] = {}, lastSplits[3] = {};
     float bestTime = -1, bestSectors[3] = {}, lastLap = -1;
+    float bestEverSectors[3] = {};  // fastest each sector has been driven on a valid lap
+    float lapDist = 0;              // distance along the track, continuous through the lap
     std::vector<GhostSample> bestGhost, curGhost;
+    std::vector<float> bestDist;  // best lap's distance at each step, as a running max
     std::vector<LapEntry> history;
     std::vector<Vec2> skids;
     size_t skidHead = 0;
@@ -225,6 +242,7 @@ struct Game {
         Vec2 t = track.tangent(i);
         car.heading = std::atan2(t.y, t.x);
         idx = i;
+        lapDist = track.arc[i];
     }
 
     void resetToGrid() {
@@ -242,9 +260,55 @@ struct Game {
 
     float sectorTime(const float* sp, int k) const { return sp[k] - (k ? sp[k - 1] : 0.0f); }
 
+    // Sum of the best-ever sectors, or -1 until every sector has one.
+    float idealLap() const {
+        float sum = 0;
+        for (float s : bestEverSectors) {
+            if (s <= 0) return -1;
+            sum += s;
+        }
+        return sum;
+    }
+
+    // Recomputes the best lap's distance profile from its ghost.
+    void rebuildBestDist() {
+        bestDist.clear();
+        bestDist.reserve(bestGhost.size());
+        int hint = 0;
+        float d = 0, run = 0;
+        for (size_t k = 0; k < bestGhost.size(); ++k) {
+            TrackHit h = track.nearest({bestGhost[k].x, bestGhost[k].y}, hint, k ? 40 : -1);
+            hint = h.seg;
+            d = track.distanceAt(h, d);
+            run = k ? std::max(run, d) : d;
+            bestDist.push_back(run);
+        }
+    }
+
+    // Time the best lap took to reach distance d, or -1 if it never did.
+    float bestTimeAt(float d) const {
+        auto it = std::lower_bound(bestDist.begin(), bestDist.end(), d);
+        if (it == bestDist.end()) return -1;
+        size_t k = size_t(it - bestDist.begin());
+        float t = (k + 1) * DT;  // sample k is recorded at the end of step k + 1
+        if (k > 0 && bestDist[k] > bestDist[k - 1])
+            t -= DT * (bestDist[k] - d) / (bestDist[k] - bestDist[k - 1]);
+        return t;
+    }
+
+    // Live gap to the best lap at the car's current position.
+    bool liveDelta(float& out) const {
+        if (!lapStarted || bestTime < 0) return false;
+        float t = bestTimeAt(lapDist);
+        if (t < 0) return false;
+        out = lapSteps * DT - t;
+        return true;
+    }
+
     void startLap() {
         lapStarted = true;
         lapValid = !offTrack;
+        lapDist = std::fmod(lapDist + track.length, track.length);
         lapSteps = 0;
         nextCp = 1;
         splitsDone = 0;
@@ -259,11 +323,22 @@ struct Game {
         std::copy(splits, splits + 3, lastSplits);
         lastLap = t;
         LapEntry e{lapNumber, t, lapValid, false};
+        bool newSectorPb = false;
+        if (lapValid) {
+            for (int k = 0; k < 3; ++k) {
+                float st = sectorTime(splits, k);
+                if (bestEverSectors[k] <= 0 || st < bestEverSectors[k]) {
+                    bestEverSectors[k] = st;
+                    newSectorPb = true;
+                }
+            }
+        }
         if (lapValid && (bestTime < 0 || t < bestTime)) {
             float prev = bestTime;
             bestTime = t;
             for (int k = 0; k < 3; ++k) bestSectors[k] = sectorTime(splits, k);
             bestGhost = curGhost;
+            rebuildBestDist();
             e.best = true;
             save();
             flash(prev < 0 ? "FIRST LAP RECORD SET " + fmtTime(t)
@@ -273,6 +348,7 @@ struct Game {
             flash("LAP " + fmtTime(t) + " NOT COUNTED", RED);
         } else {
             flash("LAP " + fmtTime(t) + "  " + fmtDelta(t - bestTime), WHITE);
+            if (newSectorPb) save();
         }
         history.push_back(e);
         startLap();
@@ -349,6 +425,7 @@ struct Game {
         const int N = track.size();
         int prevIdx = idx;
         idx = after.seg;
+        lapDist = track.distanceAt(after, lapDist);
         offTrack = after.dist > HALF_W + KERB_W + LIMIT_TOL;
         bool crossedFwd = prevIdx >= N - CROSS_BAND && idx < CROSS_BAND;
         bool crossedBack = prevIdx < CROSS_BAND && idx >= N - CROSS_BAND;
@@ -381,15 +458,41 @@ struct Game {
 
     uint32_t trackSignature() const { return uint32_t(track.size()) * 100003u + uint32_t(track.length); }
 
-    void save() const {
-        if (savePath.empty()) return;
-        FILE* f = std::fopen(savePath.c_str(), "wb");
-        if (!f) return;
+    void writeSave(FILE* f) const {
         uint32_t header[4] = {SAVE_MAGIC, SAVE_VERSION, trackSignature(), uint32_t(bestGhost.size())};
         std::fwrite(header, sizeof header, 1, f);
         std::fwrite(&bestTime, sizeof bestTime, 1, f);
         std::fwrite(bestSectors, sizeof bestSectors, 1, f);
+        std::fwrite(bestEverSectors, sizeof bestEverSectors, 1, f);
         std::fwrite(bestGhost.data(), sizeof(GhostSample), bestGhost.size(), f);
+    }
+
+    // Reads into locals first so a bad file leaves the current record alone.
+    bool readSave(FILE* f) {
+        uint32_t header[4];
+        if (std::fread(header, sizeof header, 1, f) != 1 || header[0] != SAVE_MAGIC || header[1] < 1 ||
+            header[1] > SAVE_VERSION || header[2] != trackSignature() || header[3] >= 1000000)
+            return false;
+        float time, sectors[3], ever[3];
+        std::vector<GhostSample> ghost(header[3]);
+        bool ok = std::fread(&time, sizeof time, 1, f) == 1 && std::fread(sectors, sizeof sectors, 1, f) == 1;
+        if (header[1] >= 2) ok = ok && std::fread(ever, sizeof ever, 1, f) == 1;
+        else std::copy(sectors, sectors + 3, ever);
+        ok = ok && std::fread(ghost.data(), sizeof(GhostSample), header[3], f) == header[3];
+        if (!ok) return false;
+        bestTime = time;
+        std::copy(sectors, sectors + 3, bestSectors);
+        std::copy(ever, ever + 3, bestEverSectors);
+        bestGhost = std::move(ghost);
+        rebuildBestDist();
+        return true;
+    }
+
+    void save() const {
+        if (savePath.empty()) return;
+        FILE* f = std::fopen(savePath.c_str(), "wb");
+        if (!f) return;
+        writeSave(f);
         std::fclose(f);
     }
 
@@ -397,26 +500,16 @@ struct Game {
         if (savePath.empty()) return;
         FILE* f = std::fopen(savePath.c_str(), "rb");
         if (!f) return;
-        uint32_t header[4];
-        bool ok = std::fread(header, sizeof header, 1, f) == 1 && header[0] == SAVE_MAGIC &&
-                  header[1] == SAVE_VERSION && header[2] == trackSignature() && header[3] < 1000000;
-        if (ok) {
-            bestGhost.resize(header[3]);
-            ok = std::fread(&bestTime, sizeof bestTime, 1, f) == 1 &&
-                 std::fread(bestSectors, sizeof bestSectors, 1, f) == 1 &&
-                 std::fread(bestGhost.data(), sizeof(GhostSample), header[3], f) == header[3];
-        }
+        readSave(f);
         std::fclose(f);
-        if (!ok) {
-            bestTime = -1;
-            bestGhost.clear();
-        }
     }
 
     void resetBest() {
         bestTime = -1;
         std::fill(bestSectors, bestSectors + 3, 0.0f);
+        std::fill(bestEverSectors, bestEverSectors + 3, 0.0f);
         bestGhost.clear();
+        bestDist.clear();
         for (auto& e : history) e.best = false;
         if (!savePath.empty()) std::remove(savePath.c_str());
     }
@@ -455,29 +548,65 @@ int runSelfTest() {
     std::printf("track: %d samples, %.0f px long\n", N, t.length);
 
     // Sections of track that are far apart along the lap must not overlap.
-    float cum = 0;
-    std::vector<float> arc(N);
-    for (int i = 0; i < N; ++i) {
-        arc[i] = cum;
-        cum += length(t.pts[(i + 1) % N] - t.pts[i]);
-    }
     float minGap = 1e9f;
     for (int i = 0; i < N; ++i)
         for (int j = i + 1; j < N; ++j) {
-            float along = std::min(arc[j] - arc[i], cum - (arc[j] - arc[i]));
+            float along = std::min(t.arc[j] - t.arc[i], t.length - (t.arc[j] - t.arc[i]));
             if (along > 1200.0f) minGap = std::min(minGap, length(t.pts[i] - t.pts[j]));
         }
     std::printf("closest separate sections: %.0f px (need > %.0f)\n", minGap, 2 * WALL_D);
     bool ok = minGap > 2 * WALL_D;
 
-    for (long s = 0; s < 120L * 600 && g.history.size() < 3; ++s) g.step(autopilot(g));
+    // Laps 2 and 3 are driven identically, so the live delta on lap 3 should hover near zero.
+    float maxDelta = 0;
+    int deltaSamples = 0;
+    for (long s = 0; s < 120L * 600 && g.history.size() < 3; ++s) {
+        g.step(autopilot(g));
+        float d;
+        if (g.history.size() == 2 && g.liveDelta(d)) {
+            maxDelta = std::max(maxDelta, std::fabs(d));
+            ++deltaSamples;
+        }
+    }
     for (auto& e : g.history)
         std::printf("lap %d: %s %s\n", e.number, fmtTime(e.time).c_str(), e.valid ? "valid" : "INVALID");
     bool anyValid = false;
     for (auto& e : g.history) anyValid |= e.valid;
     ok = ok && g.history.size() == 3 && anyValid && g.bestGhost.size() > 0;
-    std::printf("best: %s, ghost samples: %zu\n%s\n", fmtTime(g.bestTime).c_str(), g.bestGhost.size(),
-                ok ? "SELFTEST PASS" : "SELFTEST FAIL");
+    std::printf("best: %s, ghost samples: %zu\n", fmtTime(g.bestTime).c_str(), g.bestGhost.size());
+
+    std::printf("lap 3 live delta: max %.3f s over %d samples (need < 0.05)\n", maxDelta, deltaSamples);
+    ok = ok && deltaSamples > 3000 && maxDelta < 0.05f;
+    float ideal = g.idealLap();
+    std::printf("ideal lap: %s (need <= best)\n", fmtTime(ideal).c_str());
+    ok = ok && ideal > 0 && ideal <= g.bestTime + 1e-4f;
+
+    // Save round trip, in the current format and the old v1 one (no best-ever sectors).
+    for (uint32_t version : {SAVE_VERSION, 1u}) {
+        FILE* f = std::tmpfile();
+        if (!f) return 1;
+        if (version == SAVE_VERSION) {
+            g.writeSave(f);
+        } else {
+            uint32_t header[4] = {SAVE_MAGIC, 1, g.trackSignature(), uint32_t(g.bestGhost.size())};
+            std::fwrite(header, sizeof header, 1, f);
+            std::fwrite(&g.bestTime, sizeof g.bestTime, 1, f);
+            std::fwrite(g.bestSectors, sizeof g.bestSectors, 1, f);
+            std::fwrite(g.bestGhost.data(), sizeof(GhostSample), g.bestGhost.size(), f);
+        }
+        std::rewind(f);
+        Game h;
+        h.init();
+        bool loaded = h.readSave(f);
+        std::fclose(f);
+        const float* wantEver = version == SAVE_VERSION ? g.bestEverSectors : g.bestSectors;
+        bool same = loaded && h.bestTime == g.bestTime && h.bestGhost.size() == g.bestGhost.size() &&
+                    h.bestDist.size() == g.bestDist.size() && std::equal(wantEver, wantEver + 3, h.bestEverSectors);
+        std::printf("save v%u round trip: %s\n", version, same ? "ok" : "MISMATCH");
+        ok = ok && same;
+    }
+
+    std::printf("%s\n", ok ? "SELFTEST PASS" : "SELFTEST FAIL");
     return ok ? 0 : 1;
 }
 
@@ -863,7 +992,7 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
 
     // Timing panel.
     const float S = 3;
-    fillRect(r, 10, 10, 360, 218, {0, 0, 0, 140});
+    fillRect(r, 10, 10, 360, 244, {0, 0, 0, 140});
     float y = 22;
     drawText(r, 24, y, S, g.lapStarted ? "LAP " + std::to_string(g.lapNumber) : "OUT LAP", GOLD);
     if (g.lapStarted && !g.lapValid) drawText(r, 356, y, S, "INVALID", RED, 2);
@@ -876,12 +1005,17 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
     y += 26;
     drawText(r, 24, y, S, "BEST", PURPLE);
     drawText(r, 356, y, S, fmtTime(g.bestTime), PURPLE, 2);
+    y += 26;
+    drawText(r, 24, y, S, "IDEAL", {170, 170, 170, 255});
+    drawText(r, 356, y, S, fmtTime(g.idealLap()), {170, 170, 170, 255}, 2);
     y += 36;
 
     // Sector times for the current lap (or the one just finished, for a few seconds).
+    // Purple marks a sector that's the fastest you've ever driven it.
     bool showLast = g.splitsDone == 0 && g.lastLap > 0 && g.lapSteps < 360;
     const float* sp = showLast ? g.lastSplits : g.splits;
     int done = showLast ? 3 : g.splitsDone;
+    bool sectorsValid = showLast ? !g.history.empty() && g.history.back().valid : g.lapValid;
     for (int k = 0; k < 3; ++k, y += 26) {
         drawText(r, 24, y, S, "S" + std::to_string(k + 1), WHITE);
         if (k >= done) {
@@ -889,9 +1023,11 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
             continue;
         }
         float st = g.sectorTime(sp, k);
+        float ever = g.bestEverSectors[k];
+        bool purple = sectorsValid && (ever <= 0 || st <= ever + 0.0005f);
         char buf[16];
         std::snprintf(buf, sizeof buf, "%.3f", st);
-        drawText(r, 200, y, S, buf, WHITE, 2);
+        drawText(r, 200, y, S, buf, purple ? PURPLE : WHITE, 2);
         if (g.bestTime > 0) {
             float d = st - g.bestSectors[k];
             drawText(r, 356, y, S, fmtDelta(d), d <= 0 ? GREEN : RED, 2);
@@ -924,6 +1060,16 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
     float tb = g.lastInput.throttle * 70, bb = g.lastInput.brake * 70;
     fillRect(r, SCREEN_W / 2 - 120, SCREEN_H - 20 - tb, 10, tb, GREEN);
     fillRect(r, SCREEN_W / 2 - 104, SCREEN_H - 20 - bb, 10, bb, RED);
+
+    // Live gap to the best lap at this point on track.
+    float delta;
+    if (g.liveDelta(delta)) {
+        std::string text = fmtDelta(delta);
+        float w = std::max(textWidth(text, 5), textWidth("DELTA", 2));
+        fillRect(r, SCREEN_W / 2 - w / 2 - 16, 10, w + 32, 54, {0, 0, 0, 150});
+        drawText(r, SCREEN_W / 2, 16, 2, "DELTA", {170, 170, 170, 255}, 1);
+        drawText(r, SCREEN_W / 2, 32, 5, text, delta <= 0 ? GREEN : RED, 1);
+    }
 
     if (g.onGrass) drawText(r, SCREEN_W / 2, SCREEN_H - 130, 3, "OFF TRACK", RED, 1);
 
