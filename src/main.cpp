@@ -935,11 +935,13 @@ void render(SDL_Renderer* r, const Game& g, const View& view, const std::vector<
     if (paused && !menu.open) {
         fillRect(r, 0, 0, SCREEN_W, SCREEN_H, {0, 0, 0, 120});
         drawText(r, SCREEN_W / 2, SCREEN_H / 2 - 30, 8, "PAUSED", WHITE, 1);
+        drawText(r, SCREEN_W / 2, SCREEN_H / 2 + 20, 3, "PRESS P TO RESUME", {200, 200, 200, 255}, 1);
     }
 
-    drawText(r, 14, SCREEN_H - 22, 2,
-             "WASD/ARROWS DRIVE  SPACE HANDBRAKE  R RESTART LAP  C CAMERA  G GHOST  P PAUSE  ESC SETTINGS",
-             {220, 220, 220, 200});
+    // Two short lines in the corner so they stay clear of the speedo.
+    fillRect(r, 6, SCREEN_H - 48, 378, 42, {0, 0, 0, 110});
+    drawText(r, 14, SCREEN_H - 40, 2, "WASD/ARROWS DRIVE  SPACE HANDBRAKE  R RESTART", {220, 220, 220, 200});
+    drawText(r, 14, SCREEN_H - 22, 2, "C CAMERA  G GHOST  P PAUSE  ESC SETTINGS", {220, 220, 220, 200});
     if (menu.open) drawMenu(r, menu, set);
 }
 
@@ -1111,6 +1113,9 @@ int runGame() {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
+            // Don't keep the clock running while the player is in another window.
+            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_FOCUS_LOST && !menu.open)
+                paused = true;
             if (e.type == SDL_KEYDOWN && menu.open) {
                 switch (e.key.keysym.scancode) {
                     case SDL_SCANCODE_ESCAPE: toggleMenu(); break;
@@ -1142,11 +1147,10 @@ int runGame() {
                 int i = menuRowAt(mx, my);
                 if (i >= 0) {
                     if (i != menu.sel) menuMove(i - menu.sel);
-                    if (MENU[i].kind == Kind::Percent) {
-                        if (int dir = menuArrowAt(MENU[i], set, menu, mx)) menuAdjust(dir);
-                    } else {
-                        menuActivate();
-                    }
+                    // Arrows step either way; elsewhere on the row, choices cycle forward
+                    // and toggles flip, but percentages need an arrow.
+                    if (int dir = menuArrowAt(MENU[i], set, menu, mx)) menuAdjust(dir);
+                    else if (MENU[i].kind != Kind::Percent) menuActivate();
                 }
             }
             if (menu.open && e.type == SDL_MOUSEWHEEL && hasArrows(MENU[menu.sel])) {
